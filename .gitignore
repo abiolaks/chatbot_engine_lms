@@ -205,3 +205,19 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.claude
+
+# ── Project-specific ──────────────────────────────────────────────────────────
+
+# MuseTalk — third-party repo + model weights (clone separately, see README)
+# Keep this excluded: it contains 8.6 GB of model weights and its own .git
+MuseTalk/
+
+# Piper offline TTS voice models (download separately, see README)
+models/piper/
+
+# Test output videos
+test_musetalk_output.mp4
+
+# Whisper model cache (downloaded automatically by openai-whisper on first run)
+.cache/whisper/
