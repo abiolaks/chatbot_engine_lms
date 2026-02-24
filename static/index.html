@@ -306,18 +306,38 @@ function _stopTalkingLoop() {
   talkingVid.style.display = 'none';
 }
 
-function playAudioWithLipSync(base64Audio) {
-  if (activeSource) { try { activeSource.stop(); } catch(e){} activeSource = null; }
-  if (lipRaf) { cancelAnimationFrame(lipRaf); lipRaf = null; }
+// ── Audio queue ────────────────────────────────────────────
+// Each item: { bytes: Uint8Array, text: string, bubble: Element|null }
+// Audio clips play to completion before the next one starts —
+// no clip ever interrupts another.
+const _audioQueue = [];
+let   _queueRunning = false;
 
+function enqueueAudio(base64Audio, text, bubble) {
   const bytes = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
+  _audioQueue.push({ bytes, text, bubble });
+  if (!_queueRunning) _drainQueue();
+}
 
-  // Wait until the AudioContext has been unlocked by a user gesture.
-  // Greeting audio queues here and plays the moment the user first
-  // clicks or presses Enter — no audio is silently dropped.
+function _drainQueue() {
+  if (_audioQueue.length === 0) {
+    _queueRunning = false;
+    mouthTarget = 0;
+    _stopTalkingLoop();
+    setStatus('connected', 'Listening…');
+    return;
+  }
+  _queueRunning = true;
+  _playItem(_audioQueue.shift());
+}
+
+function _playItem({ bytes, text, bubble }) {
   _audioUnlockedPromise().then(() => {
     audioCtx.decodeAudioData(bytes.buffer.slice(0), buffer => {
       setStatus('speaking', 'Speaking…');
+
+      if (lipRaf) { cancelAnimationFrame(lipRaf); lipRaf = null; }
+
       activeSource = audioCtx.createBufferSource();
       activeSource.buffer = buffer;
 
@@ -331,10 +351,27 @@ function playAudioWithLipSync(base64Audio) {
 
       _startTalkingLoop();
 
-      // Pre-compute frequency bin indices once — they never change per audio clip.
-      // Range 100–3500 Hz captures the full voiced speech spectrum:
-      //   ~100–300 Hz  fundamental frequency + first formant
-      //   ~300–3500 Hz  second/third formants and consonant energy
+      // ── Word streaming ────────────────────────────────────────────
+      // Reveal words one at a time, evenly spread across the clip duration.
+      // This makes the text appear to scroll in sync with speech.
+      const words = text ? text.trim().split(/\s+/).filter(Boolean) : [];
+      let wordTimer = null;
+      if (words.length > 0 && bubble) {
+        const span = bubble.querySelector('.bot-text');
+        const msPerWord = (buffer.duration * 1000) / words.length;
+        let wi = 0;
+        wordTimer = setInterval(() => {
+          if (wi < words.length) {
+            span.textContent += (wi > 0 ? ' ' : '') + words[wi++];
+            chatLog.scrollTop = chatLog.scrollHeight;
+          } else {
+            clearInterval(wordTimer);
+            wordTimer = null;
+          }
+        }, msPerWord);
+      }
+
+      // ── Frequency analysis → lip amplitude ───────────────────────
       const nyquist  = audioCtx.sampleRate / 2;
       const binHz    = nyquist / analyser.frequencyBinCount;
       const loIdx    = Math.max(1, Math.floor(100  / binHz));
@@ -346,18 +383,10 @@ function playAudioWithLipSync(base64Audio) {
         let sum = 0;
         for (let i = loIdx; i <= hiIdx; i++) sum += freqData[i];
         const avg = sum / binCount / 255;
-
-        // Non-linear (power) curve: more sensitive to quiet speech so
-        // even low-volume Edge TTS output drives visible mouth movement.
-        // avg^0.6 boosts small values (0.05→0.13, 0.10→0.25, 0.20→0.43)
-        // then ×2.8 maps the result to a 0–1 target range.
         mouthTarget = Math.min(1, Math.pow(avg, 0.6) * 2.8);
-
         if (loopReady && !talkingVid.paused) {
-          // Wider playback-rate range for more expressive animation
           talkingVid.playbackRate = Math.max(0.5, Math.min(2.0, 0.5 + mouthTarget * 1.8));
         }
-
         lipRaf = requestAnimationFrame(lipLoop);
       }
       lipLoop();
@@ -365,15 +394,23 @@ function playAudioWithLipSync(base64Audio) {
       activeSource.onended = () => {
         cancelAnimationFrame(lipRaf); lipRaf = null;
         activeSource = null;
-        mouthTarget = 0;
-        _stopTalkingLoop();
-        setStatus('connected', 'Listening…');
+        // Flush any remaining words (covers edge-case timing drift)
+        if (wordTimer) { clearInterval(wordTimer); wordTimer = null; }
+        if (bubble) {
+          const span = bubble.querySelector('.bot-text');
+          if (span && text) span.textContent = text;
+        }
+        _drainQueue();
       };
+
     }, err => {
-      console.error('Audio decode:', err);
-      mouthTarget = 0;
-      _stopTalkingLoop();
-      setStatus('connected', 'Ready');
+      console.error('Audio decode error:', err);
+      // Decode failed: show full text immediately and move on
+      if (bubble) {
+        const span = bubble.querySelector('.bot-text');
+        if (span && text) span.textContent = text;
+      }
+      _drainQueue();
     });
   });
 }
@@ -393,10 +430,15 @@ function connect() {
     const msg = JSON.parse(evt.data);
     if (msg.type === 'response') {
       removeThinking();
-      appendBot(msg.text);
 
-      if (msg.video) {
-        // ── MuseTalk path: play lip-synced video inside the avatar ring ──
+      if (msg.audio) {
+        // ── Viseme path: create an empty bubble, stream words during playback ──
+        const bubble = appendBotStreaming();
+        enqueueAudio(msg.audio, msg.text, bubble);
+
+      } else if (msg.video) {
+        // ── MuseTalk path: full text shown immediately alongside the video ──
+        appendBot(msg.text);
         const bytes = Uint8Array.from(atob(msg.video), c => c.charCodeAt(0));
         const blob  = new Blob([bytes], { type: 'video/mp4' });
         const url   = URL.createObjectURL(blob);
@@ -415,9 +457,9 @@ function connect() {
           setStatus('connected', 'Ready');
         };
 
-      } else if (msg.audio) {
-        // ── Viseme path: unchanged ────────────────────────────────────────
-        playAudioWithLipSync(msg.audio);
+      } else {
+        // ── No audio/video (decode error, silent fallback) ────────────────
+        appendBot(msg.text);
       }
     }
     if (msg.type === 'recommendations') showCourses(msg.courses);
@@ -450,6 +492,15 @@ function appendBot(text) {
   d.className = 'bubble bot';
   d.innerHTML = `<div class="lbl">GENEVIEVE</div>${esc(text)}`;
   chatLog.appendChild(d); chatLog.scrollTop = chatLog.scrollHeight;
+}
+// Creates an empty bot bubble for word-streaming playback.
+// Returns the element so _playItem can fill in words during audio.
+function appendBotStreaming() {
+  const d = document.createElement('div');
+  d.className = 'bubble bot';
+  d.innerHTML = `<div class="lbl">GENEVIEVE</div><span class="bot-text"></span>`;
+  chatLog.appendChild(d); chatLog.scrollTop = chatLog.scrollHeight;
+  return d;
 }
 function showThinking() {
   const d = document.createElement('div');
