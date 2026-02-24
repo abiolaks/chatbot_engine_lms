@@ -1,120 +1,129 @@
 # Genevieve — AI Avatar Learning Advisor
 
-Genevieve is a fully local, voice-driven AI learning advisor. She listens to you, collects your learning goal, experience level, and career aspiration through natural conversation, then recommends personalised courses — all spoken aloud with real-time lip-sync animation running entirely in the browser.
+Genevieve is a fully local, voice-driven AI learning advisor. She listens to you, collects your learning goal, experience level, and career aspiration through natural conversation, then recommends personalised courses — all spoken aloud with real-time lip-sync animation and word-by-word text streaming running entirely in the browser.
 
 ---
 
 ## Table of Contents
 
-1. [Changelog — pipeline hardening & lip-sync fixes](#changelog)
+1. [Changelog](#changelog)
 2. [How the lip-sync works without MuseTalk](#how-the-lip-sync-works-without-musetalk)
-3. [The autoplay fix — what was broken and how it was solved](#the-autoplay-fix)
-3. [Architecture overview](#architecture-overview)
-4. [Prerequisites](#prerequisites)
-5. [Step-by-step local setup](#step-by-step-local-setup)
-6. [Running and using the app](#running-and-using-the-app)
-7. [Configuration reference](#configuration-reference)
-8. [Project structure](#project-structure)
-9. [Deployment guide](#deployment-guide)
-10. [MuseTalk GPU upgrade (optional)](#musetalk-gpu-upgrade-optional)
-
----
+3. [The autoplay fix](#the-autoplay-fix)
+4. [Architecture overview](#architecture-overview)
+5. [Prerequisites](#prerequisites)
+6. [Step-by-step local setup](#step-by-step-local-setup)
+7. [Running and using the app](#running-and-using-the-app)
+8. [Configuration reference](#configuration-reference)
+9. [Project structure](#project-structure)
+10. [Deployment guide](#deployment-guide)
+11. [MuseTalk GPU upgrade (optional)](#musetalk-gpu-upgrade-optional)
 
 ---
 
 ## Changelog
 
-### Pipeline hardening & lip-sync improvements (Feb 2026)
+### Audio queue + word streaming (Feb 2026)
 
-#### Problem 1 — LLM hallucination and off-topic responses
+**Problems fixed:**
 
-**Root causes found:**
-- `_BASE_PROMPT` allowed too much latitude — the model could give career advice, mention tools, or answer unrelated questions
-- A "chatting" phase after recommendations gave the LLM free-form conversation rights with almost no constraints
-- The `intro` spoken when recommendations fired was LLM-generated, opening a hallucination window for course names or false claims
-- A "sentinel" JSON extraction path could be manipulated by a crafted user message to inject goal/level/career values
-
-**What was changed in `src/nlp/ollama_conversation.py`:**
-
-1. **Replaced `_BASE_PROMPT` with `_SYSTEM_PROMPT`** — new prompt has 9 numbered absolute rules, including hardcoded fallback sentences for off-topic and help requests, zero allowed diversions
-2. **Removed the "chatting" phase entirely** — after recommendations the session resets immediately to collecting, no free-form conversation
-3. **Hardcoded the recommendation intro** (`_REC_INTRO`) — no LLM call at the moment of recommendation; a fixed string is spoken and added to history, eliminating any chance of a hallucinated course name
-4. **Added `_POST_REC_BRIDGE`** — a hardcoded sentence inviting the next search, sent after the recommendation cards, also not LLM-generated
-5. **Removed sentinel extraction completely** — `_extract_sentinel`, `_SENTINEL_RE`, and all related code paths deleted; server-side regex is the only source of truth
-6. **Lowered temperature from 0.3 → 0.2** and **reduced `num_predict` from 120 → 80** — tighter constraint on output length and creativity
-7. **Added `stop` tokens** (`["\n", ".", "?", "!"]`) — Ollama stops generating after the first sentence, enforcing the one-sentence rule at the API level
-8. **Removed `_is_farewell` / `_FAREWELL_RE`** — the "end" action is no longer used; the session model is reset by recommendation, not by farewell detection
-
-**What was changed in `src/api/routes.py`:**
-
-9. **Bridge message is synthesised and sent over WebSocket** after the recommendations payload — Genevieve speaks `_POST_REC_BRIDGE` so the user hears that they can search again
-
-#### Problem 2 — Lip-sync lagging behind the audio
-
-**Root causes found:**
-- The smoothing factor `0.18` applied symmetrically meant the mouth opened at the same (slow) rate it closed — causing noticeable lag between the start of each spoken syllable and visible mouth movement
-- The amplitude scaling `avg * 3.5` was linear — quiet Edge TTS output (typical avg energy ~0.05–0.10) produced weak mouth movement even during clear speech
-- The frequency band `300–3000 Hz` excluded the 100–300 Hz fundamental frequency range where low-frequency voiced speech energy lives
+- Audio was cut off mid-sentence when a new response arrived because each call to `playAudioWithLipSync` unconditionally stopped whatever was playing
+- The full response text was dumped into the chat bubble instantly before Genevieve had spoken a single word
 
 **What was changed in `static/index.html`:**
 
-10. **Asymmetric smoothing** — opening factor `0.40`, closing factor `0.12`. The mouth now snaps open within ~2 frames of a new syllable and fades out slowly, matching how human lips actually move
-11. **Wider frequency band** — `100–3500 Hz` (was `300–3000 Hz`). Captures the fundamental frequency and first formant which carry most of the voiced energy in Edge TTS output
-12. **Non-linear amplitude curve** — `Math.pow(avg, 0.6) * 2.8` (was `avg * 3.5`). The power of 0.6 boosts small input values so quiet speech produces visible mouth movement, while loud speech still clamps to 1.0
-13. **Talking-loop video rate range widened** — `0.5–2.0×` (was `0.6–1.5×`). Gives more expressive range at both ends of amplitude
-14. **Frequency bin indices moved outside `lipLoop`** — they never change per audio clip; computing them once avoids a division and two `Math.floor` calls every animation frame (~60/s)
+1. **Sequential audio queue** — `playAudioWithLipSync` replaced with `enqueueAudio(base64, text, bubble)` + `_drainQueue()`. Each clip plays to 100% completion via `activeSource.onended` before the next starts. Nothing ever calls `.stop()` on a playing source.
+2. **Word-by-word text streaming** — `appendBotStreaming()` creates an empty chat bubble and returns the DOM element. During playback, `_playItem` calculates `msPerWord = buffer.duration × 1000 / wordCount` and uses `setInterval` to reveal one word at a time, keeping text appearance in step with speech. When the clip ends, any remaining words are flushed immediately as a safety net for rounding drift.
+
+---
+
+### Pipeline hardening & lip-sync improvements (Feb 2026)
+
+#### LLM hallucination and off-topic responses
+
+**Root causes:**
+- The system prompt was a set of soft guidelines the model could drift away from
+- A post-recommendation "chatting" phase gave the LLM near-free-form conversation rights
+- The recommendation intro was LLM-generated — opening a window for hallucinated course names
+- A "sentinel" JSON extraction path could be injected by a crafted user message
+
+**What was changed in `src/nlp/ollama_conversation.py`:**
+
+1. **New `_SYSTEM_PROMPT`** — 9 numbered absolute rules including hardcoded fallback sentences for off-topic prompts and help requests; zero allowed diversions
+2. **Chatting phase removed** — after recommendations the session resets immediately to collecting; there is no free-form conversation mode
+3. **Hardcoded `_REC_INTRO`** — spoken the moment recommendations fire; no LLM call, eliminating any chance of a hallucinated course name
+4. **Hardcoded `_POST_REC_BRIDGE`** — invites the next search after recommendation cards are shown; also not LLM-generated
+5. **Sentinel extraction deleted** — `_extract_sentinel`, `_SENTINEL_RE`, and the `json` import removed; server-side regex is the only source of truth
+6. **Temperature `0.3 → 0.2`**, **`num_predict` `120 → 80`** — tighter constraint on creativity and length
+7. **`stop` tokens added** (`[".", "?", "!"]`) — Ollama stops generating after the first sentence at the API level
+8. **`_is_farewell` / `_FAREWELL_RE` removed** — the "end" action is gone; state resets via recommendation, not farewells
+
+**What was changed in `src/api/routes.py`:**
+
+9. **Bridge message synthesised and sent** after the recommendations payload so Genevieve speaks `_POST_REC_BRIDGE` aloud
+
+#### Lip-sync timing
+
+**Root causes:**
+- Symmetric smoothing (`0.18` both ways) meant the mouth opened as slowly as it closed — ~130 ms lag before visible movement on each syllable
+- Linear amplitude scaling (`avg × 3.5`) produced weak mouth movement for Edge TTS's typically quiet output
+- Frequency band `300–3000 Hz` missed the `100–300 Hz` fundamental frequency range of the Jenny Neural voice
+
+**What was changed in `static/index.html`:**
+
+10. **Asymmetric smoothing** — open `0.40`, close `0.12`; mouth snaps open within ~2 frames and fades out naturally
+11. **Wider frequency band** — `100–3500 Hz` (was `300–3000 Hz`)
+12. **Non-linear amplitude curve** — `Math.pow(avg, 0.6) × 2.8` (was `avg × 3.5`); quiet speech now drives visible movement
+13. **Talking-loop video rate widened** — `0.5–2.0×` (was `0.6–1.5×`)
+14. **Bin-index computation moved outside `lipLoop`** — computed once per clip, not every animation frame
+
+---
+
+### Browser autoplay fix (Feb 2026)
+
+**Problem:** Genevieve's greeting audio (and all subsequent audio) was silently dropped. `audioCtx.resume()` was called inside `ws.onmessage` — a network event, not a user gesture — so the browser refused it every time.
+
+**Fix:** `_unlockAudio()` creates the `AudioContext` and calls `resume()` **synchronously inside** the click/keydown/mic handlers where the browser trusts the gesture. All audio is then queued behind `_audioUnlockedPromise()` and plays the instant the context is running.
 
 ---
 
 ## How the lip-sync works without MuseTalk
 
-The project ships with two lip-sync modes. **Viseme mode** (the default, no GPU required) is what makes Genevieve's mouth move today. **MuseTalk mode** (optional, GPU required) replaces viseme mode with photorealistic video.
+The project ships with two lip-sync modes. **Viseme mode** (default, no GPU required) makes Genevieve's mouth move in the browser. **MuseTalk mode** (optional, GPU required) replaces viseme sprites with photorealistic video.
 
-### Viseme mode — how it works end to end
+### Viseme mode — end to end
 
-**Step 1 — Six mouth sprites are baked at server startup**
+**Step 1 — Six mouth sprites baked at startup**
 
-`src/lipsync/viseme_generator.py` runs once when the server starts. It:
+`src/lipsync/viseme_generator.py` runs once when the server starts:
 
-1. Loads the portrait photo (`static/images/portrait-business-woman-office.jpg`).
-2. Crops and resizes the face to the 220×220 px display size.
-3. Generates 6 JPEG images (`static/images/visemes/v0.jpg` … `v5.jpg`), each showing the mouth at a different degree of openness — from fully closed (v0) to wide open (v5).
-4. Each sprite is created by compositing a Gaussian-feathered dark ellipse (the mouth opening) and a smaller ivory ellipse (teeth) over the original face using OpenCV. The soft Gaussian blur on the mask means the edges blend into the real skin instead of looking painted on.
+1. Loads the portrait photo (`static/images/portrait-business-woman-office.jpg`)
+2. Crops and resizes the face to the 220×220 px canvas
+3. Generates 6 JPEGs (`v0.jpg` … `v5.jpg`) — fully closed to wide open — by compositing a Gaussian-feathered dark ellipse (mouth cavity) and an ivory ellipse (teeth) over the original face with OpenCV. The soft blur blends edges into real skin.
 
-These files are served as static assets so the browser can preload all six before the first audio plays.
+**Step 2 — Audio synthesised server-side**
 
-**Step 2 — Audio is synthesised and streamed to the browser**
+`src/tts/edge_tts.py` converts Genevieve's reply to MP3 via Microsoft Edge TTS. The bytes are base64-encoded and sent in the WebSocket `audio` field alongside the full text.
 
-When Genevieve responds, `src/tts/edge_tts.py` converts her text to MP3 using Microsoft Edge TTS (online). The MP3 bytes are base64-encoded and sent inside the WebSocket JSON message as the `audio` field.
+**Step 3 — Browser queues the clip and streams words**
 
-**Step 3 — The browser decodes the audio and drives the mouth in real time**
+On arrival the message is pushed onto `_audioQueue`. `_drainQueue` picks it up and calls `_playItem`:
 
-`static/index.html` contains a Web Audio API pipeline:
-
-1. The base64 string is decoded to a `Uint8Array`.
-2. `audioCtx.decodeAudioData()` decodes the MP3 into a PCM `AudioBuffer`.
-3. An `AnalyserNode` sits between the `BufferSource` and the speakers. Each animation frame it reads the frequency-domain data (`getByteFrequencyData`).
-4. The speech band (300–3000 Hz) is summed and averaged, giving a number between 0 and 1 that represents how loud Genevieve is speaking at that exact moment.
-5. That amplitude number directly controls `mouthTarget`. A smoothing loop (`mouthCurrent += (mouthTarget - mouthCurrent) * 0.18`) eases toward the target so the mouth opens and closes fluidly rather than jumping.
-6. `mouthCurrent` is mapped to a fractional sprite index (0–5). The `mouthLoop` renders two adjacent sprites on a `<canvas>` with alpha cross-fading: if the index is 2.7 it draws sprite 2 at full opacity then sprite 3 at 70% opacity on top, giving a smooth intermediate position that the 6 static images alone could not achieve.
-
-The result is a face that opens its mouth exactly in time with the audio, with no ML or GPU involved at all.
+1. `decodeAudioData` converts MP3 → PCM `AudioBuffer`
+2. A `BufferSource → AnalyserNode → destination` graph starts playback
+3. `msPerWord = buffer.duration × 1000 / wordCount` is calculated; `setInterval` appends one word at a time to the chat bubble
+4. Each animation frame, `getByteFrequencyData` reads the `100–3500 Hz` band; energy is averaged, passed through `Math.pow(avg, 0.6) × 2.8`, and stored as `mouthTarget`
+5. `mouthLoop` eases `mouthCurrent` toward `mouthTarget` asymmetrically (open `0.40`, close `0.12`) and maps it to a fractional sprite index. Two adjacent sprites are cross-faded on a `<canvas>` for smooth intermediate positions.
+6. `onended` flushes remaining words, then calls `_drainQueue` to start the next clip.
 
 ---
 
 ## The autoplay fix
 
-### What was broken
+Modern browsers block audio until the user has physically interacted with the page. Genevieve's greeting arrives before any click, so `AudioContext.resume()` must be called from inside a gesture handler — not from `ws.onmessage`.
 
-The server sends Genevieve's greeting the instant the WebSocket connects — before the user has clicked or typed anything. Modern browsers (Chrome, Firefox, Safari) enforce an **autoplay policy**: audio can only start playing after a direct user interaction (a click, keypress, or tap). Any attempt to start audio without a prior gesture is silently ignored.
+**The fix has three parts:**
 
-The original code called `audioCtx.resume()` inside the WebSocket `onmessage` handler. Because `onmessage` fires from a network event — not a user gesture — the browser blocked it every time. The greeting audio was decoded successfully but never played. The same thing happened for all subsequent responses because `resume()` was still being called from the wrong place.
-
-### How it was fixed
-
-Three changes were made to `static/index.html`:
-
-**1. A gesture gate was added**
+**1. A gesture gate** resolves when the context is first unlocked:
 
 ```javascript
 let _audioUnlocked = false;
@@ -126,15 +135,12 @@ function _audioUnlockedPromise() {
 }
 ```
 
-Audio playback now waits on this promise before doing anything.
-
-**2. `_unlockAudio()` is called synchronously inside every user-gesture handler**
+**2. `_unlockAudio()` is called synchronously inside every gesture handler** (send button, Enter key, mic button):
 
 ```javascript
 function _unlockAudio() {
   if (_audioUnlocked) return;
-  if (!audioCtx) audioCtx = new AudioContext();
-  // resume() is called HERE — synchronously inside the click handler stack
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const p = audioCtx.state !== 'running' ? audioCtx.resume() : Promise.resolve();
   p.then(() => {
     _audioUnlocked = true;
@@ -144,23 +150,17 @@ function _unlockAudio() {
 }
 ```
 
-This is added to the send button click, the Enter key handler, and the mic button click — the three places where the user is definitely interacting with the page. The browser sees `resume()` called synchronously in the gesture stack and allows it.
-
-**3. `playAudioWithLipSync()` queues audio until the gate opens**
+**3. `enqueueAudio()` waits behind the gate:**
 
 ```javascript
-function playAudioWithLipSync(base64Audio) {
-  const bytes = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
-
+function _playItem({ bytes, text, bubble }) {
   _audioUnlockedPromise().then(() => {
-    audioCtx.decodeAudioData(bytes.buffer.slice(0), buffer => {
-      // ... play the audio ...
-    });
+    audioCtx.decodeAudioData(bytes.buffer.slice(0), buffer => { /* play */ });
   });
 }
 ```
 
-The greeting audio now arrives over the WebSocket, is decoded, and sits waiting behind the promise. The moment the user clicks "Send" or presses Enter for the first time, `_unlockAudio()` fires, the context resumes, the promise resolves, and the greeting plays immediately.
+Greeting audio queues up immediately on connection and plays the instant the user first clicks Send or presses Enter.
 
 ---
 
@@ -176,71 +176,77 @@ Browser  ──── WebSocket ws://host/api/v1/ws ────  FastAPI (app.p
   │                                                     │
   ▼                                                     ▼
 index.html                                    src/api/routes.py
-  ├── Web Audio API (decode + play MP3)           │
-  ├── AnalyserNode → amplitude → mouthTarget      ├── STT: SpeechToText (Whisper tiny)
-  ├── Canvas viseme cross-fade                    │       audio bytes → English text
-  └── Course cards rendered from JSON            ├── NLP: OllamaConversationManager
-                                                  │       text → intent extraction
-                                                  │       → Ollama/gemma3:4b API call
-                                                  │       → structured response
-                                                  ├── Recommendations: recommend_courses()
-                                                  │       goal + level + career → top 3 courses
-                                                  └── TTS: EdgeTTS
-                                                          text → MP3 bytes
+  ├── Audio queue (_audioQueue)                   │
+  │   └── clips play sequentially to completion   ├── STT: SpeechToText (Whisper tiny)
+  ├── Word streaming (setInterval / msPerWord)    │       audio bytes → English text
+  ├── Web Audio AnalyserNode → mouthTarget        ├── NLP: OllamaConversationManager
+  ├── Asymmetric smoothing → mouthCurrent         │       regex extraction (goal/level/career)
+  ├── Canvas viseme cross-fade (v0–v5)            │       Ollama/gemma3:4b — ask for missing info
+  └── Course cards rendered from JSON            ├── Recommendations: recommend_courses()
+                                                  │       all three → top 3 courses scored
+                                                  └── TTS: EdgeTTS (MP3) → Piper fallback (WAV)
 ```
 
 ### Component responsibilities
 
 | File | What it does |
 |---|---|
-| `app.py` | FastAPI entry point, lifespan startup (generates visemes, optionally loads MuseTalk), mounts static files |
-| `config.py` | All configuration via environment variables with sensible defaults |
-| `src/api/routes.py` | WebSocket endpoint, REST endpoints (`/chat`, `/chat/audio`, `/session/{id}`) |
-| `src/stt/speech_to_text.py` | Wraps OpenAI Whisper (tiny). Accepts any browser audio format, converts via ffmpeg |
-| `src/nlp/ollama_conversation.py` | Conversation brain: per-session state, server-side intent extraction (regex), dynamic system prompt, Ollama API calls |
-| `src/tts/edge_tts.py` | Primary TTS via Microsoft Edge TTS (online). Falls back to Piper (offline) if network fails |
-| `src/tts/piper_tts.py` | Offline TTS fallback using Piper — returns WAV bytes |
-| `src/recommendations/engine.py` | Scores all 24 courses against goal/level/career using keyword overlap + level distance |
-| `src/recommendations/courses.py` | Hard-coded 24-course catalogue spanning Python, JS, ML, data science, DevOps, SQL, cloud, design |
-| `src/lipsync/viseme_generator.py` | Generates 6 mouth-state sprites from the avatar photo at startup (OpenCV only) |
-| `src/lipsync/musetalk_worker.py` | Optional GPU lip-sync: loads MuseTalk models, runs per-response inference |
-| `static/index.html` | Single-page app: WebSocket client, Web Audio API pipeline, canvas viseme renderer, chat UI |
+| `app.py` | FastAPI entry point, lifespan (generates visemes, optionally loads MuseTalk) |
+| `config.py` | All configuration via environment variables |
+| `src/api/routes.py` | WebSocket handler, REST endpoints, post-rec bridge message |
+| `src/stt/speech_to_text.py` | Whisper wrapper — accepts any browser audio format via ffmpeg |
+| `src/nlp/ollama_conversation.py` | Strict conversation manager: server-side regex extraction, dynamic system prompt, hardcoded intros |
+| `src/tts/edge_tts.py` | Edge TTS (online, MP3) with Piper offline fallback |
+| `src/tts/piper_tts.py` | Offline Piper TTS — WAV bytes, no network required |
+| `src/recommendations/engine.py` | Scores 24 courses by keyword overlap + level distance |
+| `src/recommendations/courses.py` | 24-course catalogue: Python, JS, ML, data science, DevOps, SQL, cloud, design |
+| `src/lipsync/viseme_generator.py` | Generates 6 mouth-state sprites from avatar photo at startup (OpenCV only) |
+| `src/lipsync/musetalk_worker.py` | Optional GPU lip-sync: loads MuseTalk, runs per-response inference |
+| `static/index.html` | Single-page app: audio queue, word streaming, Web Audio pipeline, canvas viseme renderer |
 
-### Conversation state machine
+### Conversation flow
 
 ```
-Session created
-      │
-      ▼
-phase = "collecting"
-  collected = { goal: None, level: None, career: None }
-      │
-      │  Each user message:
-      │  1. Regex extracts any of goal / level / career
-      │  2. Ollama generates a spoken reply asking for missing info
-      │
-      ▼  (all three collected)
-  recommend_courses() fires immediately
-  phase → "chatting"
-  collected reset to all-None
-      │
-      ▼
-phase = "chatting"
-  Follow-up questions answered directly.
-  If user mentions a new topic → phase resets to "collecting"
+WebSocket connects
+       │
+       ▼
+Hardcoded greeting spoken (no LLM call)
+       │
+       ▼
+┌─────────────────────────────────────────────┐
+│  COLLECTING                                 │
+│  collected = { goal: ?, level: ?, career: ? }│
+│                                             │
+│  Each user turn:                            │
+│  1. Regex extracts goal / level / career    │
+│  2. LLM asks for still-missing items only   │
+│     (one sentence, temperature 0.2)         │
+└──────────────────┬──────────────────────────┘
+                   │ all three filled
+                   ▼
+       recommend_courses() fires
+       Hardcoded _REC_INTRO spoken
+       Recommendation cards sent to browser
+       Hardcoded _POST_REC_BRIDGE spoken
+       collected reset to all-None
+                   │
+                   └──────► back to COLLECTING
+                             (ready for next search)
 ```
+
+The LLM is never called at the moment of recommendation. It is only called when asking for missing info. All other spoken strings are hardcoded.
 
 ---
 
 ## Prerequisites
 
-| Requirement | Version | Notes |
-|---|---|---|
-| Python | 3.10 or 3.11 | 3.12+ untested with some ML deps |
-| ffmpeg | any modern | Must be on `$PATH` — used by Whisper and TTS fallback |
-| Ollama | latest | Must be running before starting the server |
-| gemma3:4b model | — | Pulled via `ollama pull gemma3:4b` |
-| Internet connection | — | Required for Edge TTS (or set up Piper fallback for offline) |
+| Requirement | Notes |
+|---|---|
+| Python 3.10 or 3.11 | 3.12+ untested with some ML deps |
+| ffmpeg (any modern) | Must be on `$PATH` — used by Whisper and TTS fallback |
+| Ollama (latest) | Must be running before starting the server |
+| `gemma3:4b` model | Pull with `ollama pull gemma3:4b` |
+| Internet connection | Required for Edge TTS (or set up Piper for offline) |
 
 ---
 
@@ -249,11 +255,11 @@ phase = "chatting"
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url> chatbot_engine_lms
+git clone https://github.com/abiolaks/chatbot_engine_lms.git
 cd chatbot_engine_lms
 ```
 
-### 2. Create and activate a Python virtual environment
+### 2. Create and activate a virtual environment
 
 ```bash
 python3.10 -m venv .venv
@@ -267,14 +273,7 @@ source .venv/bin/activate          # macOS / Linux
 pip install -r requirements.txt
 ```
 
-`requirements.txt` installs:
-- `fastapi` + `uvicorn[standard]` — web server
-- `openai-whisper` + `torch` + `torchaudio` — speech-to-text
-- `edge-tts` — text-to-speech (online)
-- `piper-tts` — text-to-speech (offline fallback)
-- `opencv-python` + `numpy` — viseme sprite generation
-- `httpx` — async HTTP client for Ollama
-- `python-multipart` + `websockets` — FastAPI extras
+Installs: `fastapi`, `uvicorn`, `openai-whisper`, `torch`, `edge-tts`, `piper-tts`, `opencv-python`, `httpx`, `python-multipart`, `websockets`, and supporting libraries.
 
 ### 4. Install ffmpeg
 
@@ -285,8 +284,7 @@ brew install ffmpeg
 # Ubuntu / Debian
 sudo apt-get install -y ffmpeg
 
-# Windows — download from https://ffmpeg.org/download.html
-# and add the bin/ folder to your PATH
+# Windows — download from https://ffmpeg.org/download.html, add bin/ to PATH
 ```
 
 Verify: `ffmpeg -version`
@@ -294,46 +292,33 @@ Verify: `ffmpeg -version`
 ### 5. Install and start Ollama
 
 ```bash
-# macOS / Linux
 curl -fsSL https://ollama.ai/install.sh | sh
-
-# Then pull the model Genevieve uses
 ollama pull gemma3:4b
-
-# Start the server (runs in the background)
 ollama serve &
 ```
 
 Verify: `curl http://localhost:11434/api/tags`
 
-### 6. Verify the avatar image is present
+### 6. Verify the avatar image
 
-The file `static/images/portrait-business-woman-office.jpg` must exist. It is the source image for all viseme sprites. If you want to use a different avatar, replace this file — the viseme generator will automatically detect new coordinates on the next startup if you adjust the `CROP` / `MOUTH_*` constants in `src/lipsync/viseme_generator.py`.
+`static/images/portrait-business-woman-office.jpg` must exist — it is the source for all six viseme sprites. To use a different avatar, replace this file and adjust the `CROP` / `MOUTH_*` constants in `src/lipsync/viseme_generator.py`.
 
-### 7. (Optional) Set up Piper offline TTS fallback
+### 7. (Optional) Piper offline TTS fallback
 
-If you want the app to speak even without internet access:
+If you want audio even without internet access:
 
 ```bash
 mkdir -p models/piper
-
-# Download voice model (two files needed)
 wget -O models/piper/en_US-amy-medium.onnx \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
-
 wget -O models/piper/en_US-amy-medium.onnx.json \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
-```
-
-Then set the env var:
-
-```bash
 export PIPER_MODEL_PATH=models/piper/en_US-amy-medium.onnx
 ```
 
-Without this, Edge TTS works fine as long as you have internet. If Edge TTS fails and Piper is not set up, audio returns empty bytes and the text response is still shown in the chat.
+Without Piper, Edge TTS works when online. If both fail, audio is silent but text still appears in the chat.
 
-### 8. (Optional) Create a .env file
+### 8. (Optional) Create a `.env` file
 
 ```bash
 cat > .env << 'EOF'
@@ -359,7 +344,7 @@ EOF
 python app.py
 ```
 
-You will see startup logs like:
+Startup output:
 
 ```
 INFO  Generating 6 viseme sprites from static/images/portrait-business-woman-office.jpg …
@@ -368,38 +353,38 @@ INFO  Server ready → http://localhost:8000/static/index.html
 INFO  API docs    → http://localhost:8000/docs
 ```
 
-If the viseme sprites already exist from a previous run, the generator skips them instantly.
+Viseme sprites are cached — subsequent starts skip generation instantly.
 
 ### Open the chat interface
 
-Navigate to: `http://localhost:8000/static/index.html`
+`http://localhost:8000/static/index.html`
 
 ### How to have a conversation
 
-Genevieve needs three pieces of information before she can recommend courses:
+Genevieve collects three things before recommending courses:
 
 | What she needs | Examples |
 |---|---|
-| **Learning goal** | "Python", "machine learning", "web development", "SQL", "DevOps" |
-| **Experience level** | "beginner", "intermediate", "advanced" |
-| **Career goal** | "data scientist", "web developer", "software engineer", "ML engineer" |
+| **Learning goal** | Python, machine learning, web development, SQL, DevOps, cybersecurity |
+| **Experience level** | beginner, intermediate, advanced |
+| **Career goal** | data scientist, web developer, software engineer, ML engineer |
 
-You can give all three in one message:
+You can give all three at once:
 
 > "I'm a complete beginner and I want to learn Python to become a data scientist."
 
-Or answer her questions one at a time. Once she has all three, she immediately shows and speaks the top 3 recommended courses.
+Or answer her follow-up questions. The moment she has all three, she:
+1. Calls the recommendation engine immediately (server-side, no LLM)
+2. Speaks a hardcoded confirmation: *"Your personalised course recommendations are ready — take a look below."*
+3. Shows the top 3 course cards in the chat
+4. Speaks a hardcoded bridge: *"If you'd like to explore a different topic, just tell me what you want to learn next."*
+5. Resets — ready for a new search straight away
 
-After recommendations, you can ask follow-up questions. If you mention a new topic, she resets and collects fresh information for new recommendations.
+Text streams word-by-word into the chat bubble in time with speech for every response.
 
 ### Voice input
 
-Click the microphone button (🎤), speak, then click Stop (■). Your voice is:
-
-1. Recorded by the browser as WebM/Opus
-2. Base64-encoded and sent over the WebSocket
-3. Decoded and transcribed server-side by Whisper
-4. Processed as text through the normal pipeline
+Click the microphone button (🎤), speak, then click Stop (■). Your audio is recorded as WebM/Opus, sent over WebSocket, transcribed server-side by Whisper, and processed normally.
 
 ### API endpoints
 
@@ -408,37 +393,35 @@ Click the microphone button (🎤), speak, then click Stop (■). Your voice is:
 | `/api/v1/ws` | WebSocket | Real-time chat (audio + text) |
 | `/api/v1/chat` | POST | Text-only REST endpoint |
 | `/api/v1/chat/audio` | POST | Audio file upload → transcribe → chat |
-| `/api/v1/session/{id}` | GET | Get session state and recent history |
+| `/api/v1/session/{id}` | GET | Session state and recent history |
 | `/api/v1/session/{id}` | DELETE | Clear a session |
 | `/api/v1/health` | GET | Component health check |
-| `/docs` | GET | Interactive Swagger UI |
+| `/docs` | GET | Swagger UI |
 
 ---
 
 ## Configuration reference
 
-All configuration is in `config.py` and read from environment variables.
-
 | Variable | Default | Description |
 |---|---|---|
-| `LIPSYNC_MODE` | `viseme` | `viseme` = CPU sprites (default). `musetalk` = GPU video. |
+| `LIPSYNC_MODE` | `viseme` | `viseme` = CPU sprites. `musetalk` = GPU video. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `gemma3:4b` | Model name to use (must be pulled) |
-| `OLLAMA_TIMEOUT` | `30` | Seconds before Ollama call times out |
-| `WHISPER_MODEL` | `tiny` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
-| `EDGE_TTS_VOICE` | `en-US-JennyNeural` | Edge TTS voice name |
-| `EDGE_TTS_RATE` | `+0%` | Speech rate adjustment |
-| `EDGE_TTS_PITCH` | `+0%` | Pitch adjustment |
-| `PIPER_MODEL_PATH` | `models/piper/en_US-amy-medium.onnx` | Path to Piper .onnx voice file |
+| `OLLAMA_MODEL` | `gemma3:4b` | Model name (must be pulled) |
+| `OLLAMA_TIMEOUT` | `30` | Seconds before Ollama times out |
+| `WHISPER_MODEL` | `tiny` | `tiny` / `base` / `small` / `medium` / `large` |
+| `EDGE_TTS_VOICE` | `en-US-JennyNeural` | Edge TTS voice |
+| `EDGE_TTS_RATE` | `+0%` | Speech rate |
+| `EDGE_TTS_PITCH` | `+0%` | Pitch |
+| `PIPER_MODEL_PATH` | `models/piper/en_US-amy-medium.onnx` | Piper offline voice |
 
 **Whisper model tradeoff:**
 
 | Model | Size | Speed | Accuracy |
 |---|---|---|---|
-| `tiny` | 75 MB | fastest | good for clear English speech |
-| `base` | 145 MB | fast | better accuracy |
+| `tiny` | 75 MB | fastest | good for clear English |
+| `base` | 145 MB | fast | better |
 | `small` | 465 MB | moderate | noticeably better |
-| `medium` | 1.5 GB | slow on CPU | near-human accuracy |
+| `medium` | 1.5 GB | slow on CPU | near-human |
 
 ---
 
@@ -452,16 +435,16 @@ chatbot_engine_lms/
 │
 ├── static/
 │   ├── index.html                      # Single-page chat UI
+│   │                                   #   audio queue, word streaming,
+│   │                                   #   Web Audio lip-sync, viseme canvas
 │   ├── images/
 │   │   ├── portrait-business-woman-office.jpg  # Avatar source photo
 │   │   └── visemes/
-│   │       ├── v0.jpg                  # Mouth closed (generated at startup)
-│   │       ├── v1.jpg
-│   │       ├── v2.jpg
-│   │       ├── v3.jpg
-│   │       ├── v4.jpg
+│   │       ├── v0.jpg                  # Mouth closed  (generated at startup)
+│   │       ├── v1.jpg … v4.jpg
 │   │       └── v5.jpg                 # Mouth wide open
-│   └── videos/                         # (optional) talking_loop.mp4
+│   └── videos/
+│       └── talking_loop.mp4           # Optional ambient motion overlay
 │
 ├── src/
 │   ├── api/
@@ -469,10 +452,12 @@ chatbot_engine_lms/
 │   ├── stt/
 │   │   └── speech_to_text.py          # Whisper wrapper
 │   ├── tts/
-│   │   ├── edge_tts.py                # Edge TTS (primary) + Piper fallback
+│   │   ├── edge_tts.py                # Edge TTS primary + Piper fallback
 │   │   └── piper_tts.py               # Offline Piper TTS
 │   ├── nlp/
-│   │   └── ollama_conversation.py     # Conversation manager + intent extraction
+│   │   └── ollama_conversation.py     # Strict conversation manager
+│   │                                  #   server-side regex extraction
+│   │                                  #   hardcoded intros, no chatting phase
 │   ├── recommendations/
 │   │   ├── courses.py                 # 24-course catalogue
 │   │   └── engine.py                  # Keyword + level scoring
@@ -480,36 +465,30 @@ chatbot_engine_lms/
 │       ├── viseme_generator.py        # CPU sprite generator (active)
 │       └── musetalk_worker.py         # GPU lip-sync wrapper (optional)
 │
-├── MuseTalk/                          # MuseTalk repo (for GPU mode only)
-│   ├── models/
-│   │   ├── musetalkV15/unet.pth       # 3.2 GB UNet weights
-│   │   ├── sd-vae/                    # 319 MB VAE
-│   │   └── whisper/                   # 144 MB audio encoder
-│   └── results/v15/avatars/genevieve/ # Pre-computed face latents (cached)
+├── MuseTalk/                          # MuseTalk repo — excluded from git
+│   ├── models/                        # 8.6 GB weights (download separately)
+│   └── results/v15/avatars/genevieve/ # Cached face latents
 │
 └── models/
-    └── piper/                         # (optional) Piper offline voice models
+    └── piper/                         # Optional offline TTS voice models
 ```
 
 ---
 
 ## Deployment guide
 
-### Option A — Single server (no Docker)
+### Option A — Single server (systemd + Nginx)
 
-This is the simplest production setup: one Linux VPS running everything.
+**Minimum spec:** Ubuntu 22.04, 2 vCPU, 4 GB RAM
 
-**Tested on:** Ubuntu 22.04, 2 vCPU, 4 GB RAM (adequate for `tiny` Whisper + `gemma3:4b` via Ollama)
-
-#### 1. Provision the server and install system packages
+#### 1. System packages
 
 ```bash
 sudo apt-get update && sudo apt-get install -y \
-  python3.10 python3.10-venv python3-pip \
-  ffmpeg git curl nginx
+  python3.10 python3.10-venv python3-pip ffmpeg git curl nginx
 ```
 
-#### 2. Install Ollama and pull the model
+#### 2. Ollama
 
 ```bash
 curl -fsSL https://ollama.ai/install.sh | sh
@@ -517,17 +496,16 @@ sudo systemctl enable --now ollama
 ollama pull gemma3:4b
 ```
 
-#### 3. Clone the repo and install Python deps
+#### 3. App
 
 ```bash
-git clone <your-repo-url> /opt/chatbot
+git clone https://github.com/abiolaks/chatbot_engine_lms.git /opt/chatbot
 cd /opt/chatbot
-python3.10 -m venv .venv
-source .venv/bin/activate
+python3.10 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-#### 4. Create the environment file
+#### 4. Environment file
 
 ```bash
 cat > /opt/chatbot/.env << 'EOF'
@@ -539,7 +517,7 @@ EDGE_TTS_VOICE=en-US-JennyNeural
 EOF
 ```
 
-#### 5. Create a systemd service
+#### 5. systemd service
 
 ```bash
 sudo tee /etc/systemd/system/chatbot.service << 'EOF'
@@ -559,44 +537,37 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now chatbot
+sudo systemctl daemon-reload && sudo systemctl enable --now chatbot
 ```
 
-Check logs: `sudo journalctl -fu chatbot`
+Logs: `sudo journalctl -fu chatbot`
 
-#### 6. Set up Nginx as a reverse proxy (adds HTTPS support)
+#### 6. Nginx reverse proxy
 
-WebSockets require special proxy configuration:
+WebSockets require explicit `Upgrade` headers — without them the browser connection silently fails:
 
 ```nginx
-# /etc/nginx/sites-available/chatbot
 server {
     listen 80;
     server_name your-domain.com;
-
-    # Redirect HTTP → HTTPS
     return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl;
     server_name your-domain.com;
-
     ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
 
-    # WebSocket endpoint — must use wss:// in production
     location /api/v1/ws {
         proxy_pass         http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header   Upgrade $http_upgrade;
         proxy_set_header   Connection "upgrade";
         proxy_set_header   Host $host;
-        proxy_read_timeout 86400;   # keep WebSocket alive
+        proxy_read_timeout 86400;
     }
 
-    # All other requests
     location / {
         proxy_pass       http://127.0.0.1:8000;
         proxy_set_header Host $host;
@@ -608,8 +579,6 @@ server {
 ```bash
 sudo ln -s /etc/nginx/sites-available/chatbot /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
-
-# Free TLS cert
 sudo apt-get install certbot python3-certbot-nginx
 sudo certbot --nginx -d your-domain.com
 ```
@@ -618,18 +587,14 @@ sudo certbot --nginx -d your-domain.com
 
 ### Option B — Docker Compose
 
-The easiest way to run everything reproducibly, including Ollama.
-
 #### `docker-compose.yml`
 
 ```yaml
 version: "3.9"
 services:
-
   chatbot:
     build: .
-    ports:
-      - "8000:8000"
+    ports: ["8000:8000"]
     environment:
       LIPSYNC_MODE:    ${LIPSYNC_MODE:-viseme}
       OLLAMA_BASE_URL: http://ollama:11434
@@ -643,8 +608,7 @@ services:
 
   ollama:
     image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
+    volumes: [ollama_data:/root/.ollama]
     environment:
       OLLAMA_KEEP_ALIVE: "24h"
     healthcheck:
@@ -662,48 +626,39 @@ volumes:
 
 ```dockerfile
 FROM python:3.10-slim
-
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . .
-
 EXPOSE 8000
 CMD ["python", "app.py"]
 ```
 
-#### Run it
+#### Run
 
 ```bash
-# Build and start
 docker-compose up --build -d
-
-# Pull the Ollama model (first time only)
 docker-compose exec ollama ollama pull gemma3:4b
-
-# Check logs
-docker-compose logs -f chatbot
-
-# Open
-open http://localhost:8000/static/index.html
+# open http://localhost:8000/static/index.html
 ```
 
 ---
 
-### Option C — GPU server with MuseTalk
+### Option C — GPU server (MuseTalk photorealistic lip-sync)
 
-Use this only if you have a machine with an NVIDIA GPU (8 GB VRAM minimum) and want photorealistic lip-sync video instead of viseme sprites. **The entire rest of the pipeline is unchanged** — only the lip-sync step swaps.
+Replaces the viseme sprite step with a real talking-head video. Everything else in the pipeline is unchanged.
 
-#### Additional requirements
+**Requirements:** NVIDIA GPU 8 GB VRAM+, CUDA 12, PyTorch 2.0.1
 
-- CUDA 12 + cuDNN
-- PyTorch 2.0.1 with CUDA support
-- MuseTalk model weights (already in `MuseTalk/models/` if you cloned with LFS)
+#### Clone MuseTalk and download weights
 
-#### Install MuseTalk dependencies
+```bash
+git clone https://github.com/TMElyralab/MuseTalk MuseTalk
+cd MuseTalk && bash download_weights.sh && cd ..
+```
+
+#### Install MuseTalk Python dependencies
 
 ```bash
 cd MuseTalk
@@ -713,59 +668,13 @@ mim install mmengine "mmcv==2.0.1" "mmdet==3.1.0" "mmpose==1.1.0"
 cd ..
 ```
 
-#### Verify model weights exist
-
-```bash
-ls MuseTalk/models/musetalkV15/unet.pth      # 3.2 GB
-ls MuseTalk/models/sd-vae/                   # 319 MB
-ls MuseTalk/models/whisper/                  # 144 MB
-ls MuseTalk/models/dwpose/
-ls MuseTalk/models/face-parse-bisent/
-```
-
 #### Start in MuseTalk mode
 
 ```bash
 LIPSYNC_MODE=musetalk python app.py
 ```
 
-On first startup the server prepares the avatar (extracts face landmarks and VAE latents, ~60 seconds). The latents are cached to `MuseTalk/results/v15/avatars/genevieve/` — subsequent starts skip preparation and load in seconds.
-
-#### Docker Compose for GPU
-
-```yaml
-# docker-compose.gpu.yml
-services:
-  chatbot-gpu:
-    build: .
-    runtime: nvidia
-    environment:
-      LIPSYNC_MODE:    musetalk
-      OLLAMA_BASE_URL: http://ollama:11434
-      OLLAMA_MODEL:    gemma3:4b
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    ports:
-      - "8000:8000"
-    depends_on: [ollama]
-
-  ollama:
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
-
-volumes:
-  ollama_data:
-```
-
-```bash
-docker-compose -f docker-compose.gpu.yml up --build -d
-```
+On first run the avatar face latents are prepared (~60 s) and cached to `MuseTalk/results/v15/avatars/genevieve/`. Subsequent starts skip preparation.
 
 ---
 
@@ -773,10 +682,17 @@ docker-compose -f docker-compose.gpu.yml up --build -d
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| "Reconnecting…" in browser | WebSocket blocked by proxy | Add `Upgrade` + `Connection` headers in Nginx (see above) |
-| No audio in browser | HTTPS required for microphone | Add TLS with certbot; `wss://` is used automatically when the page is HTTPS |
-| Ollama timeout errors | Model not loaded or too slow | Increase `OLLAMA_TIMEOUT`; use a faster model like `gemma3:2b` |
-| Whisper crashes on startup | PyTorch / CUDA mismatch | Install CPU-only torch: `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu` |
-| Viseme sprites missing | Avatar image not found | Confirm `static/images/portrait-business-woman-office.jpg` exists before starting |
-| Edge TTS silent | No internet / Microsoft API down | Set up Piper fallback (see step 7 in local setup) |
-| MuseTalk OOM | Not enough VRAM | Reduce `batch_size` in `musetalk_worker.py` `_make_args()` from 8 to 4 |
+| "Reconnecting…" in browser | WebSocket blocked by proxy | Add `Upgrade` + `Connection` headers in Nginx config |
+| Microphone button does nothing | HTTPS required for `getUserMedia` | Add TLS via certbot; browser auto-uses `wss://` on HTTPS pages |
+| No audio at all | AudioContext not unlocked | User must click Send or mic before audio plays (autoplay policy) |
+| Ollama timeout errors | Model cold or overloaded | Increase `OLLAMA_TIMEOUT`; try `gemma3:2b` for faster responses |
+| Whisper crashes on startup | PyTorch / CUDA mismatch | `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu` |
+| Viseme sprites missing | Avatar image not found | Confirm `static/images/portrait-business-woman-office.jpg` exists |
+| Edge TTS silent | No internet / API down | Set up Piper fallback (setup step 7) |
+| MuseTalk OOM | Insufficient VRAM | Reduce `batch_size` in `musetalk_worker.py` `_make_args()` from 8 to 4 |
+
+---
+
+## MuseTalk GPU upgrade (optional)
+
+See [Option C](#option-c--gpu-server-musetalk-photorealistic-lip-sync) above. The `src/lipsync/musetalk_worker.py` integration is already written and the avatar latents are pre-computed — enabling MuseTalk requires only cloning the MuseTalk repo, downloading weights, and setting `LIPSYNC_MODE=musetalk`.
