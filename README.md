@@ -6,8 +6,9 @@ Genevieve is a fully local, voice-driven AI learning advisor. She listens to you
 
 ## Table of Contents
 
-1. [How the lip-sync works without MuseTalk](#how-the-lip-sync-works-without-musetalk)
-2. [The autoplay fix — what was broken and how it was solved](#the-autoplay-fix)
+1. [Changelog — pipeline hardening & lip-sync fixes](#changelog)
+2. [How the lip-sync works without MuseTalk](#how-the-lip-sync-works-without-musetalk)
+3. [The autoplay fix — what was broken and how it was solved](#the-autoplay-fix)
 3. [Architecture overview](#architecture-overview)
 4. [Prerequisites](#prerequisites)
 5. [Step-by-step local setup](#step-by-step-local-setup)
@@ -16,6 +17,52 @@ Genevieve is a fully local, voice-driven AI learning advisor. She listens to you
 8. [Project structure](#project-structure)
 9. [Deployment guide](#deployment-guide)
 10. [MuseTalk GPU upgrade (optional)](#musetalk-gpu-upgrade-optional)
+
+---
+
+---
+
+## Changelog
+
+### Pipeline hardening & lip-sync improvements (Feb 2026)
+
+#### Problem 1 — LLM hallucination and off-topic responses
+
+**Root causes found:**
+- `_BASE_PROMPT` allowed too much latitude — the model could give career advice, mention tools, or answer unrelated questions
+- A "chatting" phase after recommendations gave the LLM free-form conversation rights with almost no constraints
+- The `intro` spoken when recommendations fired was LLM-generated, opening a hallucination window for course names or false claims
+- A "sentinel" JSON extraction path could be manipulated by a crafted user message to inject goal/level/career values
+
+**What was changed in `src/nlp/ollama_conversation.py`:**
+
+1. **Replaced `_BASE_PROMPT` with `_SYSTEM_PROMPT`** — new prompt has 9 numbered absolute rules, including hardcoded fallback sentences for off-topic and help requests, zero allowed diversions
+2. **Removed the "chatting" phase entirely** — after recommendations the session resets immediately to collecting, no free-form conversation
+3. **Hardcoded the recommendation intro** (`_REC_INTRO`) — no LLM call at the moment of recommendation; a fixed string is spoken and added to history, eliminating any chance of a hallucinated course name
+4. **Added `_POST_REC_BRIDGE`** — a hardcoded sentence inviting the next search, sent after the recommendation cards, also not LLM-generated
+5. **Removed sentinel extraction completely** — `_extract_sentinel`, `_SENTINEL_RE`, and all related code paths deleted; server-side regex is the only source of truth
+6. **Lowered temperature from 0.3 → 0.2** and **reduced `num_predict` from 120 → 80** — tighter constraint on output length and creativity
+7. **Added `stop` tokens** (`["\n", ".", "?", "!"]`) — Ollama stops generating after the first sentence, enforcing the one-sentence rule at the API level
+8. **Removed `_is_farewell` / `_FAREWELL_RE`** — the "end" action is no longer used; the session model is reset by recommendation, not by farewell detection
+
+**What was changed in `src/api/routes.py`:**
+
+9. **Bridge message is synthesised and sent over WebSocket** after the recommendations payload — Genevieve speaks `_POST_REC_BRIDGE` so the user hears that they can search again
+
+#### Problem 2 — Lip-sync lagging behind the audio
+
+**Root causes found:**
+- The smoothing factor `0.18` applied symmetrically meant the mouth opened at the same (slow) rate it closed — causing noticeable lag between the start of each spoken syllable and visible mouth movement
+- The amplitude scaling `avg * 3.5` was linear — quiet Edge TTS output (typical avg energy ~0.05–0.10) produced weak mouth movement even during clear speech
+- The frequency band `300–3000 Hz` excluded the 100–300 Hz fundamental frequency range where low-frequency voiced speech energy lives
+
+**What was changed in `static/index.html`:**
+
+10. **Asymmetric smoothing** — opening factor `0.40`, closing factor `0.12`. The mouth now snaps open within ~2 frames of a new syllable and fades out slowly, matching how human lips actually move
+11. **Wider frequency band** — `100–3500 Hz` (was `300–3000 Hz`). Captures the fundamental frequency and first formant which carry most of the voiced energy in Edge TTS output
+12. **Non-linear amplitude curve** — `Math.pow(avg, 0.6) * 2.8` (was `avg * 3.5`). The power of 0.6 boosts small input values so quiet speech produces visible mouth movement, while loud speech still clamps to 1.0
+13. **Talking-loop video rate range widened** — `0.5–2.0×` (was `0.6–1.5×`). Gives more expressive range at both ends of amplitude
+14. **Frequency bin indices moved outside `lipLoop`** — they never change per audio clip; computing them once avoids a division and two `Math.floor` calls every animation frame (~60/s)
 
 ---
 

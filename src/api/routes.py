@@ -120,6 +120,28 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "recommendations",
                     "courses": response["recommendations"],
                 })
+                # After recommendations, speak the bridge prompt so the user
+                # knows they can start a new search immediately.
+                from ..nlp.ollama_conversation import _POST_REC_BRIDGE
+                bridge_audio = await tts.synthesize(_POST_REC_BRIDGE)
+                if Config.LIPSYNC_MODE == "musetalk" and bridge_audio:
+                    from ..lipsync.musetalk_worker import generate_video
+                    bridge_video = await generate_video(bridge_audio)
+                    await websocket.send_json({
+                        "type":   "response",
+                        "text":   _POST_REC_BRIDGE,
+                        "action": "continue",
+                        "video":  base64.b64encode(bridge_video).decode(),
+                        "collected_info": {"goal": None, "level": None, "career": None},
+                    })
+                else:
+                    await websocket.send_json({
+                        "type":   "response",
+                        "text":   _POST_REC_BRIDGE,
+                        "action": "continue",
+                        "audio":  base64.b64encode(bridge_audio).decode() if bridge_audio else None,
+                        "collected_info": {"goal": None, "level": None, "career": None},
+                    })
 
     except WebSocketDisconnect:
         logger.info(f"Client disconnected: {session_id}")

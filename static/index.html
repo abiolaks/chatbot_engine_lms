@@ -230,8 +230,11 @@ function initAvatar() {
 
 // ── Mouth animation loop ───────────────────────────────────────
 function mouthLoop() {
-  // Ease toward target amplitude
-  mouthCurrent += (mouthTarget - mouthCurrent) * 0.18;
+  // Asymmetric easing: snap open quickly (0.40), close more slowly (0.12).
+  // Matches natural speech — mouth opens fast on each syllable and
+  // lingers slightly before fully closing between words.
+  const smoothFactor = mouthTarget > mouthCurrent ? 0.40 : 0.12;
+  mouthCurrent += (mouthTarget - mouthCurrent) * smoothFactor;
 
   // Map 0–1 amplitude to sprite index 0–5 with linear interpolation
   const exactIdx = Math.max(0, Math.min(NUM_SPRITES - 1, mouthCurrent * (NUM_SPRITES - 1)));
@@ -328,20 +331,31 @@ function playAudioWithLipSync(base64Audio) {
 
       _startTalkingLoop();
 
+      // Pre-compute frequency bin indices once — they never change per audio clip.
+      // Range 100–3500 Hz captures the full voiced speech spectrum:
+      //   ~100–300 Hz  fundamental frequency + first formant
+      //   ~300–3500 Hz  second/third formants and consonant energy
       const nyquist  = audioCtx.sampleRate / 2;
       const binHz    = nyquist / analyser.frequencyBinCount;
-      const loIdx    = Math.floor(300  / binHz);
-      const hiIdx    = Math.floor(3000 / binHz);
+      const loIdx    = Math.max(1, Math.floor(100  / binHz));
+      const hiIdx    = Math.min(analyser.frequencyBinCount - 1, Math.floor(3500 / binHz));
+      const binCount = hiIdx - loIdx + 1;
 
       function lipLoop() {
         analyser.getByteFrequencyData(freqData);
         let sum = 0;
         for (let i = loIdx; i <= hiIdx; i++) sum += freqData[i];
-        const avg = sum / (hiIdx - loIdx + 1) / 255;
-        mouthTarget = Math.min(1, avg * 3.5);
+        const avg = sum / binCount / 255;
+
+        // Non-linear (power) curve: more sensitive to quiet speech so
+        // even low-volume Edge TTS output drives visible mouth movement.
+        // avg^0.6 boosts small values (0.05→0.13, 0.10→0.25, 0.20→0.43)
+        // then ×2.8 maps the result to a 0–1 target range.
+        mouthTarget = Math.min(1, Math.pow(avg, 0.6) * 2.8);
 
         if (loopReady && !talkingVid.paused) {
-          talkingVid.playbackRate = Math.max(0.6, Math.min(1.5, 0.6 + mouthTarget * 1.5));
+          // Wider playback-rate range for more expressive animation
+          talkingVid.playbackRate = Math.max(0.5, Math.min(2.0, 0.5 + mouthTarget * 1.8));
         }
 
         lipRaf = requestAnimationFrame(lipLoop);
