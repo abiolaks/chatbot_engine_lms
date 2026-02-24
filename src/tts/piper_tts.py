@@ -53,12 +53,26 @@ def _load_voice(model_path: Path) -> bool:
 
 
 def _synthesize_sync(text: str) -> bytes:
-    """Synchronous Piper synthesis — returns WAV bytes."""
+    """Synchronous Piper synthesis — returns WAV bytes.
+
+    piper-tts ≥1.4 changed the API: synthesize() now returns
+    Iterable[AudioChunk] instead of accepting a wave.Wave_write argument.
+    We collect all chunks and write them into a single WAV buffer manually.
+    """
     if _voice is None:
         return b""
+    chunks = list(_voice.synthesize(text))
+    if not chunks:
+        return b""
+    # All chunks share the same audio parameters; read from the first one.
+    first = chunks[0]
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
-        _voice.synthesize(text, wav_file)
+        wav_file.setnchannels(first.sample_channels)
+        wav_file.setsampwidth(first.sample_width)
+        wav_file.setframerate(first.sample_rate)
+        for chunk in chunks:
+            wav_file.writeframes(chunk.audio_int16_bytes)
     return buf.getvalue()
 
 
