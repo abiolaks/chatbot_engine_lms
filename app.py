@@ -30,8 +30,9 @@ async def lifespan(app: FastAPI):
     # ── STARTUP ───────────────────────────────────────────────────────────
     logger.info("Starting AI Learning Advisor chatbot…")
 
-    # Generate viseme sprites so the browser can load them immediately
-    avatar = Path("static/images/portrait-business-woman-office.jpg")
+    # Generate viseme sprites so the browser can load them immediately.
+    # Uses Config.AVATAR_IMAGE_PATH so swapping the avatar in config is enough.
+    avatar = Config.AVATAR_IMAGE_PATH
     if avatar.exists():
         try:
             from src.lipsync.viseme_generator import ensure_visemes

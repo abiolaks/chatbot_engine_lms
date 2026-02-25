@@ -560,6 +560,88 @@ document.getElementById('text-input').addEventListener('keydown', e => {
 let mediaRecorder = null, audioChunks = [], isRecording = false;
 const recBtn = document.getElementById('record-btn');
 
+// ── VAD — Voice Activity Detection ─────────────────────────────────────────
+// After the user starts recording, a separate AnalyserNode monitors the mic
+// energy. When energy drops below the speech threshold for VAD_SILENCE_MS
+// continuously (and the user has already spoken at least once), recording
+// stops and the audio is sent automatically — no button click needed.
+//
+// The existing TTS analyser is completely unaffected: _vadAnalyser only
+// connects to the MediaStream source; it does NOT touch audioCtx.destination.
+//
+// State machine:
+//   idle     → mic open, no speech detected yet (don't auto-stop)
+//   speaking → energy ≥ VAD_SPEECH_THRESHOLD
+//   silence  → energy < VAD_SILENCE_THRESHOLD after speech seen, countdown starts
+//              if user speaks again the countdown resets
+//   done     → silence window expired, stop() called
+
+const VAD_SPEECH_THRESHOLD  = 22;   // freq-bin average (0-255) above which = speech
+const VAD_SILENCE_THRESHOLD = 12;   // below which = silence
+const VAD_SILENCE_MS        = 1500; // ms of sustained silence → auto-send
+
+let _vadAnalyser  = null;   // AnalyserNode on the mic stream
+let _vadInterval  = null;   // polling setInterval id
+let _silenceStart = null;   // performance.now() when silence phase began
+let _speechSeen   = false;  // true once user has spoken at least one syllable
+
+function _startVAD(stream) {
+  // Build an AnalyserNode on the raw mic stream.
+  // audioCtx is guaranteed to exist here — _unlockAudio() ran first.
+  const micSrc = audioCtx.createMediaStreamSource(stream);
+  _vadAnalyser  = audioCtx.createAnalyser();
+  _vadAnalyser.fftSize = 512;
+  _vadAnalyser.smoothingTimeConstant = 0.4;
+  micSrc.connect(_vadAnalyser);            // mic → analyser (NOT → destination)
+
+  const buf     = new Uint8Array(_vadAnalyser.frequencyBinCount);
+  _speechSeen   = false;
+  _silenceStart = null;
+
+  _vadInterval = setInterval(() => {
+    if (!isRecording) { _stopVAD(); return; }
+
+    _vadAnalyser.getByteFrequencyData(buf);
+    const avg = buf.reduce((s, v) => s + v, 0) / buf.length;
+
+    if (avg >= VAD_SPEECH_THRESHOLD) {
+      // ── Speech detected ────────────────────────────────────────
+      _speechSeen   = true;
+      _silenceStart = null;          // reset any active silence countdown
+      setStatus('listening', 'Listening…');
+
+    } else if (_speechSeen) {
+      // ── Silence after speech ───────────────────────────────────
+      if (_silenceStart === null) _silenceStart = performance.now();
+
+      const elapsed   = performance.now() - _silenceStart;
+      const remaining = Math.max(0, VAD_SILENCE_MS - elapsed);
+
+      if (remaining > 0) {
+        setStatus('listening', `Auto-send in ${(remaining / 1000).toFixed(1)}s…`);
+      } else {
+        // ── Auto-stop triggered ────────────────────────────────
+        _stopVAD();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        isRecording = false;
+        recBtn.classList.remove('recording');
+        recBtn.innerHTML = '&#127908;';
+        recBtn.title = 'Record voice';
+      }
+    }
+    // else: silence with no speech yet → keep waiting, no countdown
+  }, 50);
+}
+
+function _stopVAD() {
+  if (_vadInterval)  { clearInterval(_vadInterval); _vadInterval = null; }
+  _vadAnalyser  = null;
+  _silenceStart = null;
+  _speechSeen   = false;
+}
+
 function getBestMime() {
   const types = [
     'audio/webm;codecs=opus', 'audio/webm',
@@ -571,6 +653,7 @@ function getBestMime() {
 recBtn.addEventListener('click', async () => {
   _unlockAudio();   // unlock AudioContext synchronously inside this gesture
   if (isRecording) {
+    _stopVAD();           // cancel any pending auto-send countdown
     mediaRecorder.stop();
     isRecording = false;
     recBtn.classList.remove('recording');
@@ -608,6 +691,7 @@ recBtn.addEventListener('click', async () => {
     recBtn.innerHTML = '&#9632;';
     recBtn.title = 'Stop recording';
     setStatus('listening', 'Listening…');
+    _startVAD(stream);   // begin silence-detection; auto-sends when you stop talking
 
   } catch (err) {
     console.error('Mic error:', err);

@@ -7,19 +7,19 @@ startup.  Uses only OpenCV — no ML, no GPU.
 Technique per frame
 ───────────────────
 1. Crop + resize the portrait to the 220 × 220 display canvas.
-2. Erase the original closed-mouth detail with a soft skin-coloured patch
-   (colour sampled from the cheek directly above the mouth).
-3. Draw layered mouth shapes using Gaussian-feathered alpha compositing:
+2. Draw layered mouth shapes using Gaussian-feathered alpha compositing:
      a. Dark interior ellipse (the opening)
-     b. Teeth strip (upper part of opening, when open ≥ 4 px)
-     c. Upper lip band  (at the top edge of the opening)
-     d. Lower lip band  (at the bottom edge of the opening)
+     b. Teeth strip (upper part of opening, when open ≥ 5 px)
    Each layer is a soft ellipse blended with a Gaussian-blurred mask,
    so edges feather naturally into the surrounding skin.
-4. Save as JPEG to static/images/visemes/v{N}.jpg
+3. Save as JPEG to static/images/visemes/v{N}.jpg
 
 All mouth coordinates were computed by OpenCV face detection against
-portrait-business-woman-office.jpg (3840 × 5760 px).
+crop_portrait_gen.png (946 × 720 px).
+
+Auto-regeneration: if the source avatar image is newer than the existing
+sprites, ensure_visemes() will regenerate them automatically without
+requiring force=True.
 """
 
 import logging
@@ -31,18 +31,20 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CROP = {"sx": 242, "sy": 793, "sw": 3269, "sh": 3269}
+# Crop parameters computed by OpenCV face detection on crop_portrait_gen.png
+# (946×720). Square crop centred on the face, face fills ~75% of canvas height.
+CROP = {"sx": 226, "sy": 1, "sw": 461, "sh": 461}
 CANVAS = 220          # output size (px)
 
-# Mouth on the 220 × 220 canvas (from OpenCV face detection)
+# Mouth centre on the 220 × 220 canvas (from OpenCV face detection)
 MOUTH_CX = 110
-MOUTH_CY = 149
-MOUTH_HW = 37         # half-width  — matches JS constant M.hw
+MOUTH_CY = 143
+MOUTH_HW = 37         # half-width
 NUM_VISEMES = 6        # v0 (closed) … v5 (wide open)
-MAX_OPEN_H  = 22       # max vertical half-height in px — matches JS M.maxH
+MAX_OPEN_H  = 22       # max vertical half-height in px
 
 VISEME_DIR = Path("static/images/visemes")
-AVATAR_IMG = Path("static/images/portrait-business-woman-office.jpg")
+AVATAR_IMG = Path("static/images/crop_portrait_gen.png")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -60,8 +62,14 @@ def ensure_visemes(
     paths = [str(output_dir / f"v{i}.jpg") for i in range(NUM_VISEMES)]
 
     if not force and all(Path(p).exists() for p in paths):
-        logger.info("Viseme sprites already up-to-date — skipping generation.")
-        return paths
+        # Auto-regenerate if the source avatar is newer than the oldest sprite.
+        # This means swapping the avatar image automatically triggers fresh visemes.
+        src_mtime    = image_path.stat().st_mtime if image_path.exists() else 0
+        sprite_mtime = min(Path(p).stat().st_mtime for p in paths)
+        if src_mtime <= sprite_mtime:
+            logger.info("Viseme sprites already up-to-date — skipping generation.")
+            return paths
+        logger.info("Avatar image is newer than sprites — regenerating.")
 
     logger.info(f"Generating {NUM_VISEMES} viseme sprites from {image_path} …")
 
