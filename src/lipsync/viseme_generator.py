@@ -17,9 +17,10 @@ Technique per frame
 All mouth coordinates were computed by OpenCV face + mouth detection against
 gen_2.png (1092 × 918 px).
 
-Auto-regeneration: if the source avatar image is newer than the existing
-sprites, ensure_visemes() will regenerate them automatically without
-requiring force=True.
+Auto-regeneration: ensure_visemes() writes a marker file (.source) beside
+the sprites recording which avatar image they were generated from.  On the
+next startup the marker is compared to AVATAR_IMG.name; a mismatch (or
+missing marker) triggers regeneration immediately — no mtime tricks needed.
 """
 
 import logging
@@ -38,7 +39,7 @@ CANVAS = 220          # output size (px)
 
 # Mouth centre on the 220 × 220 canvas (from OpenCV face + mouth detection)
 MOUTH_CX = 113
-MOUTH_CY = 148
+MOUTH_CY = 155
 MOUTH_HW = 38         # half-width
 NUM_VISEMES = 6        # v0 (closed) … v5 (wide open)
 MAX_OPEN_H  = 21       # max vertical half-height in px
@@ -55,21 +56,23 @@ def ensure_visemes(
     force: bool = False,
 ) -> list[str]:
     """
-    Generate viseme sprites if they don't already exist.
+    Generate viseme sprites, skipping only when they were previously built
+    from the same source image (tracked via a .source marker file).
+
     Returns a list of absolute file paths [v0.jpg … v5.jpg].
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    paths = [str(output_dir / f"v{i}.jpg") for i in range(NUM_VISEMES)]
+    paths  = [str(output_dir / f"v{i}.jpg") for i in range(NUM_VISEMES)]
+    marker = output_dir / ".source"
 
     if not force and all(Path(p).exists() for p in paths):
-        # Auto-regenerate if the source avatar is newer than the oldest sprite.
-        # This means swapping the avatar image automatically triggers fresh visemes.
-        src_mtime    = image_path.stat().st_mtime if image_path.exists() else 0
-        sprite_mtime = min(Path(p).stat().st_mtime for p in paths)
-        if src_mtime <= sprite_mtime:
+        # Sprites exist — only skip if they came from the same source file.
+        if marker.exists() and marker.read_text().strip() == image_path.name:
             logger.info("Viseme sprites already up-to-date — skipping generation.")
             return paths
-        logger.info("Avatar image is newer than sprites — regenerating.")
+        logger.info(
+            f"Avatar source changed to {image_path.name} — regenerating sprites."
+        )
 
     logger.info(f"Generating {NUM_VISEMES} viseme sprites from {image_path} …")
 
@@ -89,6 +92,9 @@ def ensure_visemes(
         cv2.imwrite(paths[i], frame, [cv2.IMWRITE_JPEG_QUALITY, 94])
         logger.info(f"  v{i}.jpg  (open_h={open_h}px)")
 
+    # Write source marker so future startups know which avatar these came from.
+    marker = output_dir / ".source"
+    marker.write_text(image_path.name)
     logger.info("Viseme generation complete.")
     return paths
 
