@@ -562,81 +562,102 @@ const recBtn = document.getElementById('record-btn');
 
 // ── VAD — Voice Activity Detection ─────────────────────────────────────────
 // After the user starts recording, a separate AnalyserNode monitors the mic
-// energy. When energy drops below the speech threshold for VAD_SILENCE_MS
-// continuously (and the user has already spoken at least once), recording
-// stops and the audio is sent automatically — no button click needed.
+// energy in the speech frequency band (100–3500 Hz) — the same band the
+// lip-sync uses — so the threshold is reliable regardless of mic gain.
 //
-// The existing TTS analyser is completely unaffected: _vadAnalyser only
-// connects to the MediaStream source; it does NOT touch audioCtx.destination.
+// WHY speech-band only:
+//   Full-spectrum averaging spreads speech energy across ~256 bins but
+//   only ~35 carry speech. Even loud talking averages to ~15/255 over
+//   all bins — below any reasonable threshold. Averaging only the
+//   speech-band bins gives 40-120 for speech vs 5-15 for silence:
+//   well-separated and stable.
+//
+// The existing TTS analyser is completely unaffected: _vadAnalyser
+// connects to the mic MediaStreamSource only — NOT to audioCtx.destination.
 //
 // State machine:
-//   idle     → mic open, no speech detected yet (don't auto-stop)
-//   speaking → energy ≥ VAD_SPEECH_THRESHOLD
-//   silence  → energy < VAD_SILENCE_THRESHOLD after speech seen, countdown starts
-//              if user speaks again the countdown resets
-//   done     → silence window expired, stop() called
+//   idle     → mic open, no speech yet (never auto-stops without speech)
+//   speaking → speech-band energy ≥ VAD_SPEECH_THRESHOLD
+//   silence  → energy falls after speech, 1.5 s countdown starts;
+//              resets immediately if user speaks again
+//   done     → countdown expires → mediaRecorder.stop() → audio sent
 
-const VAD_SPEECH_THRESHOLD  = 22;   // freq-bin average (0-255) above which = speech
-const VAD_SILENCE_THRESHOLD = 12;   // below which = silence
-const VAD_SILENCE_MS        = 1500; // ms of sustained silence → auto-send
+const VAD_SPEECH_THRESHOLD = 30;    // speech-band avg (0-255) above which = speaking
+const VAD_SILENCE_MS       = 1500;  // ms of sustained silence → auto-send
 
-let _vadAnalyser  = null;   // AnalyserNode on the mic stream
-let _vadInterval  = null;   // polling setInterval id
-let _silenceStart = null;   // performance.now() when silence phase began
-let _speechSeen   = false;  // true once user has spoken at least one syllable
+let _vadAnalyser  = null;
+let _vadInterval  = null;
+let _vadLoIdx     = 0;    // speech-band low  bin (computed in _startVAD)
+let _vadHiIdx     = 0;    // speech-band high bin (computed in _startVAD)
+let _silenceStart = null;
+let _speechSeen   = false;
 
 function _startVAD(stream) {
-  // Build an AnalyserNode on the raw mic stream.
-  // audioCtx is guaranteed to exist here — _unlockAudio() ran first.
+  // audioCtx is guaranteed to exist — _unlockAudio() ran synchronously first.
   const micSrc = audioCtx.createMediaStreamSource(stream);
-  _vadAnalyser  = audioCtx.createAnalyser();
-  _vadAnalyser.fftSize = 512;
-  _vadAnalyser.smoothingTimeConstant = 0.4;
-  micSrc.connect(_vadAnalyser);            // mic → analyser (NOT → destination)
+  _vadAnalyser = audioCtx.createAnalyser();
+  _vadAnalyser.fftSize = 1024;           // 512 bins, ~43 Hz/bin @ 44100 Hz
+  _vadAnalyser.smoothingTimeConstant = 0.3;
+  micSrc.connect(_vadAnalyser);          // mic → analyser only, NOT → destination
 
-  const buf     = new Uint8Array(_vadAnalyser.frequencyBinCount);
+  // Speech-band bin indices (100–3500 Hz), same calculation as the lip-sync.
+  const nyquist = audioCtx.sampleRate / 2;
+  const binHz   = nyquist / _vadAnalyser.frequencyBinCount;
+  _vadLoIdx = Math.max(1, Math.floor(100  / binHz));
+  _vadHiIdx = Math.min(_vadAnalyser.frequencyBinCount - 1, Math.floor(3500 / binHz));
+
+  const buf = new Uint8Array(_vadAnalyser.frequencyBinCount);
   _speechSeen   = false;
   _silenceStart = null;
 
-  _vadInterval = setInterval(() => {
-    if (!isRecording) { _stopVAD(); return; }
+  // 200 ms startup delay: mic hardware needs a moment to open fully.
+  // The first frames are near-zero even when the user is speaking.
+  setTimeout(() => {
+    if (!isRecording) return;   // user already stopped manually
 
-    _vadAnalyser.getByteFrequencyData(buf);
-    const avg = buf.reduce((s, v) => s + v, 0) / buf.length;
+    _vadInterval = setInterval(() => {
+      if (!isRecording) { _stopVAD(); return; }
 
-    if (avg >= VAD_SPEECH_THRESHOLD) {
-      // ── Speech detected ────────────────────────────────────────
-      _speechSeen   = true;
-      _silenceStart = null;          // reset any active silence countdown
-      setStatus('listening', 'Listening…');
+      _vadAnalyser.getByteFrequencyData(buf);
 
-    } else if (_speechSeen) {
-      // ── Silence after speech ───────────────────────────────────
-      if (_silenceStart === null) _silenceStart = performance.now();
+      // Average energy in the speech band only
+      let sum = 0;
+      for (let i = _vadLoIdx; i <= _vadHiIdx; i++) sum += buf[i];
+      const avg = sum / (_vadHiIdx - _vadLoIdx + 1);
 
-      const elapsed   = performance.now() - _silenceStart;
-      const remaining = Math.max(0, VAD_SILENCE_MS - elapsed);
+      if (avg >= VAD_SPEECH_THRESHOLD) {
+        // ── Speech detected ────────────────────────────────────
+        _speechSeen   = true;
+        _silenceStart = null;         // reset any active silence countdown
+        setStatus('listening', 'Listening…');
 
-      if (remaining > 0) {
-        setStatus('listening', `Auto-send in ${(remaining / 1000).toFixed(1)}s…`);
-      } else {
-        // ── Auto-stop triggered ────────────────────────────────
-        _stopVAD();
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-          mediaRecorder.stop();
+      } else if (_speechSeen) {
+        // ── Silence after speech ──────────────────────────────
+        if (_silenceStart === null) _silenceStart = performance.now();
+        const elapsed   = performance.now() - _silenceStart;
+        const remaining = Math.max(0, VAD_SILENCE_MS - elapsed);
+
+        if (remaining > 0) {
+          setStatus('listening', `Auto-send in ${(remaining / 1000).toFixed(1)}s…`);
+        } else {
+          // ── Auto-stop ─────────────────────────────────────
+          _stopVAD();
+          if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
+          }
+          isRecording = false;
+          recBtn.classList.remove('recording');
+          recBtn.innerHTML = '&#127908;';
+          recBtn.title = 'Record voice';
         }
-        isRecording = false;
-        recBtn.classList.remove('recording');
-        recBtn.innerHTML = '&#127908;';
-        recBtn.title = 'Record voice';
       }
-    }
-    // else: silence with no speech yet → keep waiting, no countdown
-  }, 50);
+      // else: silence before any speech → keep waiting, no countdown
+    }, 50);
+  }, 200);
 }
 
 function _stopVAD() {
-  if (_vadInterval)  { clearInterval(_vadInterval); _vadInterval = null; }
+  if (_vadInterval) { clearInterval(_vadInterval); _vadInterval = null; }
   _vadAnalyser  = null;
   _silenceStart = null;
   _speechSeen   = false;

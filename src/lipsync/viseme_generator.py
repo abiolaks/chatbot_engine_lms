@@ -14,8 +14,8 @@ Technique per frame
    so edges feather naturally into the surrounding skin.
 3. Save as JPEG to static/images/visemes/v{N}.jpg
 
-All mouth coordinates were computed by OpenCV face detection against
-crop_portrait_gen.png (946 × 720 px).
+All mouth coordinates were computed by OpenCV face + mouth detection against
+gen_2.png (1092 × 918 px).
 
 Auto-regeneration: if the source avatar image is newer than the existing
 sprites, ensure_visemes() will regenerate them automatically without
@@ -31,20 +31,20 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# Crop parameters computed by OpenCV face detection on crop_portrait_gen.png
-# (946×720). Square crop centred on the face, face fills ~75% of canvas height.
-CROP = {"sx": 226, "sy": 1, "sw": 461, "sh": 461}
+# Crop parameters computed by OpenCV face detection on gen_2.png (1092×918).
+# Square crop centred on the face, face fills ~72% of canvas height.
+CROP = {"sx": 332, "sy": 117, "sw": 389, "sh": 389}
 CANVAS = 220          # output size (px)
 
-# Mouth centre on the 220 × 220 canvas (from OpenCV face detection)
-MOUTH_CX = 110
-MOUTH_CY = 143
-MOUTH_HW = 37         # half-width
+# Mouth centre on the 220 × 220 canvas (from OpenCV face + mouth detection)
+MOUTH_CX = 113
+MOUTH_CY = 148
+MOUTH_HW = 38         # half-width
 NUM_VISEMES = 6        # v0 (closed) … v5 (wide open)
-MAX_OPEN_H  = 22       # max vertical half-height in px
+MAX_OPEN_H  = 21       # max vertical half-height in px
 
 VISEME_DIR = Path("static/images/visemes")
-AVATAR_IMG = Path("static/images/crop_portrait_gen.png")
+AVATAR_IMG = Path("static/images/gen_2.png")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
