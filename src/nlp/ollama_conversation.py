@@ -50,23 +50,23 @@ _POST_REC_BRIDGE = (
 # Single, strict prompt. There is no "chatting" variant — after
 # recommendations the session resets and this same prompt is reused.
 
-_SYSTEM_PROMPT = """You are Genevieve, an AI learning advisor. Your ONLY task is to collect three pieces of information from the user so a recommendation engine can find the right courses.
+_SYSTEM_PROMPT = """You are Genevieve, a voice learning advisor. Collect goal, level, and career — then the system finds courses automatically.
 
-The three items you must collect:
-  goal   — what subject or technology they want to learn (e.g. Python, web development, SQL)
-  level  — their experience level: beginner, intermediate, or advanced
-  career — their target job or career goal (e.g. data scientist, web developer)
+RULES:
+1. ONE sentence only (spoken aloud by TTS — keep it short and natural).
+2. Acknowledge what the user just said, then ask for what is STILL NEEDED.
+3. Ask for ALL missing items in that one sentence.
+4. Never re-ask for things already collected.
+5. No filler words: no "Great!", "Sure!", "Of course!".
+6. Never name any course, platform, or tool.
+7. Off-topic input (jokes, weather): "I'm here to match you with courses — what would you like to learn?"
 
-Absolute rules — break none of them:
-1. Speak in ONE sentence only. This is spoken aloud by text-to-speech.
-2. Ask ONLY for items that are still missing. Never mention an item already provided.
-3. Ask for ALL missing items in a single sentence — never split across multiple turns.
-4. Do NOT discuss anything outside of collecting the three items above.
-5. Do NOT give advice, explain concepts, mention tools, or elaborate on any topic.
-6. Do NOT invent, mention, or recommend any course, resource, or platform name.
-7. Do NOT use filler phrases: no "Great!", "Sure!", "Absolutely!", "Of course!".
-8. If the user says something off-topic, respond with exactly one sentence: "I'm here to match you with the right courses — what would you like to learn?"
-9. If the user asks what you can do, respond with exactly: "Tell me what you want to learn, your experience level, and your career goal."
+EXAMPLE RESPONSES (match this style exactly):
+• All three missing:  "What would you like to learn, what's your experience level, and what career are you working toward?"
+• Goal just given:    "What's your experience level — beginner, intermediate, or advanced — and what's your career goal?"
+• Goal + level given: "And what career are you aiming for?"
+• Level just given:   "What would you like to learn, and what's your target career?"
+• Career just given:  "What would you like to learn, and what's your experience level?"
 """
 
 
@@ -95,8 +95,9 @@ def _build_system_prompt(collected: dict) -> str:
         }
         missing_str = " and ".join(labels[k] for k in missing)
         prompt += (
-            f"\n\nSTILL NEEDED: {missing_str}. "
-            "Ask for all missing items in ONE short sentence."
+            f"\n\nSTILL NEEDED: {missing_str}."
+            f"\n\nYOUR RESPONSE: Write exactly ONE sentence asking for {missing_str}."
+            "\nDo NOT say you are here to help. Do NOT trigger rule 7. Just ask the question."
         )
 
     return prompt
@@ -108,33 +109,55 @@ def _build_system_prompt(collected: dict) -> str:
 
 _LEVEL_RE = {
     "beginner": re.compile(
-        r"\b(beginner|new to|just start|no experience|starting out|never|"
-        r"newbie|novice|zero knowledge|complete(ly)? new|first time)\b",
+        r"\b(beginner|new to|just start(ed|ing)?|no experience|starting out|"
+        r"never (used|done|tried)|newbie|novice|zero knowledge|complete(ly)? new|"
+        r"first time|brand new|from scratch|entry.?level|just (learning|getting started)|"
+        r"haven.t (used|done|tried)|no (idea|background|clue))\b",
         re.I,
     ),
     "intermediate": re.compile(
-        r"\b(intermediate|some experience|familiar|know a (bit|little)|"
-        r"been using|used before|working knowledge|some background)\b",
+        r"\b(intermediate|some experience|familiar (with)?|know a (bit|little)|"
+        r"been (using|working with)|used before|working knowledge|some background|"
+        r"comfortable with|worked with|hands.on|moderate(ly)?|decent (knowledge|grasp)|"
+        r"self.taught|few months|couple (of )?(months|years)|few years|some coding|"
+        r"some programming)\b",
         re.I,
     ),
     "advanced": re.compile(
         r"\b(advanced|expert|experienced|senior|professional|proficient|"
-        r"years of|deep knowledge|strong background)\b",
+        r"years of|deep knowledge|strong background|extensive|multiple years|"
+        r"many years|mastered|lead (dev|engineer)|principal|production experience|"
+        r"[0-9]+ years)\b",
         re.I,
     ),
 }
 
 _GOAL_PATTERNS = [
-    (re.compile(r"\b(python)\b", re.I),                                          "Python"),
-    (re.compile(r"\b(machine learning|deep learning|\bml\b|\bai\b|neural|nlp)\b", re.I), "machine learning"),
-    (re.compile(r"\b(web dev(elopment)?|html|css|javascript|react|node\.?js|vue|angular|frontend|front.end)\b", re.I), "web development"),
-    (re.compile(r"\b(data science|data analy(sis|tics))\b", re.I),               "data science"),
-    (re.compile(r"\b(sql|database|postgres|mysql|mongodb)\b", re.I),             "SQL"),
-    (re.compile(r"\b(devops|docker|kubernetes|k8s|ci.?cd|cloud)\b", re.I),       "DevOps"),
-    (re.compile(r"\b(java\b|spring boot)\b", re.I),                              "Java"),
-    (re.compile(r"\b(excel|spreadsheet|vba)\b", re.I),                           "Excel"),
-    (re.compile(r"\b(data engineer(ing)?)\b", re.I),                             "data engineering"),
-    (re.compile(r"\b(cyber.?security|ethical hack(ing)?)\b", re.I),              "cybersecurity"),
+    (re.compile(r"\b(python|django|flask|fastapi|pandas|numpy)\b", re.I),        "Python"),
+    (re.compile(r"\b(machine learning|deep learning|\bml\b|\bai\b|neural|nlp|"
+                r"llm|generative ai|pytorch|tensorflow|keras|computer vision|"
+                r"artificial intelligence)\b", re.I),                            "machine learning"),
+    (re.compile(r"\b(web dev(elopment)?|html|css|javascript|typescript|react|"
+                r"next\.?js|node\.?js|vue|angular|svelte|frontend|front.end|"
+                r"web design|build (websites?|web apps?)|fullstack|full.?stack|"
+                r"back.?end)\b", re.I),                                           "web development"),
+    (re.compile(r"\b(data science|data analy(sis|tics)|tableau|power bi|"
+                r"statistics|statistical|visualization|reporting)\b", re.I),     "data science"),
+    (re.compile(r"\b(sql|database|postgres|mysql|mongodb|sqlite|oracle|"
+                r"database design|relational|queries?)\b", re.I),                "SQL"),
+    (re.compile(r"\b(devops|docker|kubernetes|k8s|ci.?cd|cloud|aws|gcp|azure|"
+                r"terraform|ansible|microservices|infrastructure|containeriz)\b", re.I), "DevOps"),
+    (re.compile(r"\b(java\b|spring boot|j2ee|maven|gradle)\b", re.I),           "Java"),
+    (re.compile(r"\b(excel|spreadsheet|vba|pivot table|macros?|financial model)\b", re.I), "Excel"),
+    (re.compile(r"\b(data engineer(ing)?|etl|apache spark|hadoop|data pipeline|"
+                r"data warehouse|data lake)\b", re.I),                           "data engineering"),
+    (re.compile(r"\b(cyber.?security|ethical hack(ing)?|penetration test(ing)?|"
+                r"pentesting|infosec|network security)\b", re.I),               "cybersecurity"),
+    (re.compile(r"\b(mobile (dev(elopment)?|app)|ios|android|swift|kotlin|"
+                r"flutter|react native)\b", re.I),                               "mobile development"),
+    # General programming — catch-all for "coding", "programming", "build apps"
+    (re.compile(r"\b(programming|coding|build (apps?|software|systems?)|"
+                r"software development|computer science)\b", re.I),              "programming"),
 ]
 
 _CAREER_PATTERNS = [
@@ -148,6 +171,8 @@ _CAREER_PATTERNS = [
     (re.compile(r"\b(product manager|\bpm\b)\b", re.I),                "product manager"),
     (re.compile(r"\b(business analyst)\b", re.I),                      "business analyst"),
     (re.compile(r"\b(ml engineer|machine learning engineer)\b", re.I), "ML engineer"),
+    # Catch-all for standalone "developer", "programmer", "coder"
+    (re.compile(r"\b(developer|programmer|coder|software dev)\b", re.I), "software engineer"),
 ]
 
 
@@ -236,10 +261,13 @@ class OllamaConversationManager:
 
         # ── Step 2: Server-side extraction ────────────────────────────────
         # Extract goal / level / career from what the user just said.
-        # Only store a value if it is not already known (never overwrite).
+        # Allow correction: if user explicitly contradicts a stored value
+        # (e.g. "actually I'm advanced"), overwrite.  Otherwise never overwrite
+        # so a garbled Whisper transcription can't corrupt known good values.
         extracted = _extract_info(user_text)
+        correction_words = re.search(r"\b(actually|no|wait|sorry|correction|i meant|i mean)\b", user_text, re.I)
         for key, val in extracted.items():
-            if val and not collected.get(key):
+            if val and (not collected.get(key) or correction_words):
                 collected[key] = val
                 logger.info(f"[{session_id}] Extracted {key}={val!r}")
 
@@ -263,9 +291,11 @@ class OllamaConversationManager:
                 f"career={triggered_by['career']!r}"
             )
 
-            # Reset state so next message starts fresh collection
+            # Reset state so next message starts fresh collection.
+            # Clear message history so old goal/level/career context doesn't
+            # bleed into the next search. Keep only the rec-intro as context.
             session["collected"] = {"goal": None, "level": None, "career": None}
-            session["messages"].append({"role": "assistant", "content": _REC_INTRO})
+            session["messages"] = [{"role": "assistant", "content": _REC_INTRO}]
 
             return {
                 "text":            _REC_INTRO,
@@ -306,8 +336,12 @@ class OllamaConversationManager:
             "stream":   False,
             "options": {
                 "temperature": 0.2,    # Very low — maximise instruction-following
-                "num_predict": 80,     # Hard cap: one sentence is ~15-30 tokens
-                "stop":        ["\n", ".", "?", "!"],  # Stop at end of first sentence
+                "num_predict": 120,    # Allow up to ~one sentence of tokens
+                # NOTE: do NOT use stop=["\n",".",…] — it strips terminal
+                # punctuation (stops AT the char without including it), so
+                # "What do you want to learn?" becomes "What do you want to
+                # learn" → code appends "." → question becomes statement.
+                # Instead, extract the first sentence below.
             },
         }
         try:
@@ -315,8 +349,13 @@ class OllamaConversationManager:
                 resp = await client.post(f"{self.base_url}/api/chat", json=payload)
                 resp.raise_for_status()
                 raw = resp.json()["message"]["content"].strip()
-                # Ensure the response ends with sentence-final punctuation
-                if raw and raw[-1] not in ".?!":
+                # Extract the first complete sentence, preserving its own
+                # terminal punctuation (. ? !).  If nothing matches (no
+                # sentence-ending punctuation), fall back to adding ".".
+                m = re.match(r'(.+?[.?!])', raw, re.DOTALL)
+                if m:
+                    raw = m.group(1).strip()
+                elif raw and raw[-1] not in ".?!":
                     raw += "."
                 return raw
         except httpx.ConnectError:

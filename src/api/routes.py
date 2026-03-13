@@ -79,7 +79,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_bytes_in = base64.b64decode(audio_b64)
                     user_text = stt.transcribe(audio_bytes_in, mime_type=mime)
                     if not user_text:
-                        user_text = "[Could not understand audio]"
+                        # Transcription returned nothing (silence, noise, or
+                        # too short).  Send a TTS retry prompt — do NOT pass
+                        # this to the LLM or it triggers rule-8 every time.
+                        retry_text = "I didn't catch that — please try again."
+                        retry_audio = await tts.synthesize(retry_text)
+                        sess = conversation.get_session(session_id)
+                        await websocket.send_json({
+                            "type":           "response",
+                            "text":           retry_text,
+                            "action":         "continue",
+                            "audio":          base64.b64encode(retry_audio).decode() if retry_audio else None,
+                            "collected_info": sess["collected"] if sess else {},
+                        })
+                        continue
                 else:
                     user_text = ""
             else:

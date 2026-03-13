@@ -17,3 +17,15 @@ pydantic
 librosa
 httpx
 ollama
+face-alignment
+imageio
+imageio-ffmpeg
+# SadTalker dependencies (for talking_loop.mp4 generation only)
+kornia
+yacs
+resampy
+av
+facexlib
+safetensors
+scipy
+scikit-image

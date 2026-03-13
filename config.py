@@ -11,10 +11,10 @@ class Config:
     (STATIC_DIR / "images").mkdir(parents=True, exist_ok=True)
     (STATIC_DIR / "videos").mkdir(exist_ok=True)
 
-    AVATAR_IMAGE_PATH = STATIC_DIR / "images" / "gen_2.png"
+    AVATAR_IMAGE_PATH = STATIC_DIR / "images" / "Genevieve.png"
     OUTPUT_VIDEO_PATH = STATIC_DIR / "videos" / "response_"
 
-    WHISPER_MODEL = "tiny"
+    WHISPER_MODEL = "base"   # "tiny" mis-transcribes most conversational speech; "base" gives reliable accuracy
 
     # Edge TTS models
     EDGE_TTS_VOICE = "en-US-JennyNeural"

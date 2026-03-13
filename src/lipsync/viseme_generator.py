@@ -1,26 +1,33 @@
 """
 src/lipsync/viseme_generator.py
 
-Generates N mouth-state (viseme) images from the real face photo at server
-startup.  Uses only OpenCV — no ML, no GPU.
+Generates 6 viseme sprites (v0 … v5) from the portrait photo at server startup.
+Uses only OpenCV + NumPy — no ML, no GPU.
 
-Technique per frame
-───────────────────
-1. Crop + resize the portrait to the 220 × 220 display canvas.
-2. Draw layered mouth shapes using Gaussian-feathered alpha compositing:
-     a. Dark interior ellipse (the opening)
-     b. Teeth strip (upper part of opening, when open ≥ 5 px)
-   Each layer is a soft ellipse blended with a Gaussian-blurred mask,
-   so edges feather naturally into the surrounding skin.
-3. Save as JPEG to static/images/visemes/v{N}.jpg
+Technique
+─────────
+For each mouth-open state (open_h = 0 … MAX_OPEN_H pixels):
 
-All mouth coordinates were computed by OpenCV face + mouth detection against
-gen_2.png (1092 × 918 px).
+  v0  open_h = 0   →  natural photo, unmodified (lips closed)
+  v1…v5             →  jaw-warp: the lower face is physically shifted DOWN
+                        by `open_h` pixels so the jaw actually drops and the
+                        mouth opens using real face pixels — nothing is painted.
 
-Auto-regeneration: ensure_visemes() writes a marker file (.source) beside
-the sprites recording which avatar image they were generated from.  On the
-next startup the marker is compared to AVATAR_IMG.name; a mismatch (or
-missing marker) triggers regeneration immediately — no mtime tricks needed.
+                     The gap that forms between the fixed upper lip and the
+                     dropped jaw is filled with a Gaussian-feathered ellipse
+                     whose colour is sampled from the actual lip pixels in the
+                     portrait and darkened to ~20 % brightness.  This keeps
+                     the mouth interior in exactly the right hue for this face.
+
+The browser then cross-fades between adjacent sprites based on real-time audio
+amplitude (analyser FFT), so the mouth appears to open/close smoothly in sync
+with the TTS voice.
+
+Auto-regeneration
+─────────────────
+ensure_visemes() writes a .source marker beside the sprites recording which
+avatar image they came from.  On the next startup the marker is compared to
+AVATAR_IMG.name; a mismatch (or missing marker) triggers regeneration.
 """
 
 import logging
@@ -32,20 +39,19 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# Crop parameters computed by OpenCV face detection on gen_2.png (1092×918).
-# Square crop centred on the face, face fills ~72% of canvas height.
-CROP = {"sx": 332, "sy": 117, "sw": 389, "sh": 389}
-CANVAS = 220          # output size (px)
+# Crop parameters computed by OpenCV face detection on Genevieve.png (864×1184).
+CROP   = {"sx": 263, "sy": 130, "sw": 310, "sh": 310}
+CANVAS = 220          # output canvas size in pixels
 
-# Mouth centre on the 220 × 220 canvas (from OpenCV face + mouth detection)
-MOUTH_CX = 113
-MOUTH_CY = 155
-MOUTH_HW = 38         # half-width
-NUM_VISEMES = 6        # v0 (closed) … v5 (wide open)
-MAX_OPEN_H  = 21       # max vertical half-height in px
+# Mouth geometry on the 220 × 220 canvas (OpenCV face + mouth detection)
+MOUTH_CX  = 111       # lip-centre x
+MOUTH_CY  = 161       # lip-parting line y  (upper–lower boundary)
+MOUTH_HW  = 36        # half-width of the mouth region
+NUM_VISEMES = 6       # v0 (closed) … v5 (wide open)
+MAX_OPEN_H  = 12      # max jaw-drop in pixels at v5
 
 VISEME_DIR = Path("static/images/visemes")
-AVATAR_IMG = Path("static/images/gen_2.png")
+AVATAR_IMG = Path("static/images/Genevieve.png")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -66,13 +72,10 @@ def ensure_visemes(
     marker = output_dir / ".source"
 
     if not force and all(Path(p).exists() for p in paths):
-        # Sprites exist — only skip if they came from the same source file.
         if marker.exists() and marker.read_text().strip() == image_path.name:
-            logger.info("Viseme sprites already up-to-date — skipping generation.")
+            logger.info("Viseme sprites up-to-date — skipping generation.")
             return paths
-        logger.info(
-            f"Avatar source changed to {image_path.name} — regenerating sprites."
-        )
+        logger.info(f"Avatar changed to {image_path.name} — regenerating sprites.")
 
     logger.info(f"Generating {NUM_VISEMES} viseme sprites from {image_path} …")
 
@@ -80,26 +83,23 @@ def ensure_visemes(
     if img is None:
         raise FileNotFoundError(f"Avatar image not found: {image_path}")
 
-    # Crop and resize to display canvas
-    c = CROP
+    c    = CROP
     crop = img[c["sy"]: c["sy"] + c["sh"], c["sx"]: c["sx"] + c["sw"]]
     face = cv2.resize(crop, (CANVAS, CANVAS), interpolation=cv2.INTER_LANCZOS4)
 
     for i in range(NUM_VISEMES):
-        t      = i / (NUM_VISEMES - 1)       # 0.0 … 1.0
+        t      = i / (NUM_VISEMES - 1)
         open_h = int(round(t * MAX_OPEN_H))
         frame  = _make_viseme(face, MOUTH_CX, MOUTH_CY, MOUTH_HW, open_h)
-        cv2.imwrite(paths[i], frame, [cv2.IMWRITE_JPEG_QUALITY, 94])
-        logger.info(f"  v{i}.jpg  (open_h={open_h}px)")
+        cv2.imwrite(paths[i], frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        logger.info(f"  v{i}.jpg  open_h={open_h} px")
 
-    # Write source marker so future startups know which avatar these came from.
-    marker = output_dir / ".source"
     marker.write_text(image_path.name)
-    logger.info("Viseme generation complete.")
+    logger.info("Viseme sprites generated.")
     return paths
 
 
-# ── Core: layered alpha-composite mouth blend ─────────────────────────────────
+# ── Core: jaw-warp viseme ─────────────────────────────────────────────────────
 
 def _make_viseme(
     face: np.ndarray,
@@ -108,76 +108,65 @@ def _make_viseme(
     open_h: int,
 ) -> np.ndarray:
     """
-    Composite an open-mouth shape into `face` using layered soft fills.
-
-    Each layer is a Gaussian-feathered ellipse so edges blend naturally
-    into the surrounding skin without hard boundaries or colour mismatch.
+    Produce one viseme frame via jaw-warp.
 
     Parameters
     ----------
-    face   : 220 × 220 BGR image
-    mx, my : mouth centre on the canvas
-    hw     : half-width of the mouth opening ellipse
-    open_h : vertical half-height  (0 = closed mouth)
+    face   : 220×220 BGR portrait (the cropped + resized original photo)
+    mx, my : mouth centre x and lip-parting y on the canvas
+    hw     : mouth half-width
+    open_h : how many pixels to drop the jaw (0 = closed)
+
+    How it works
+    ------------
+    1. Keep the upper face (y < my) pixel-perfect from the original.
+    2. Copy the lower face (y ≥ my) downward by open_h rows — the jaw
+       physically drops using the real portrait pixels.
+    3. Sample the lip-line pixel colour from the original photo and darken it
+       to ~20 % to get a realistic mouth-interior colour for this face.
+    4. Fill the gap (y = my … my+open_h) with that colour using a
+       Gaussian-feathered ellipse mask so the edges blend naturally into both
+       the upper lip above and the dropped jaw below.
     """
     if open_h <= 0:
         return face.copy()
 
-    H, W = face.shape[:2]
+    H, W   = face.shape[:2]
     canvas = face.astype(np.float32).copy()
 
-    # ── Colour constants ───────────────────────────────────────────────────
-    dark  = np.array([20., 12., 15.])       # dark mouth interior (BGR)
-    ivory = np.array([218., 213., 208.])    # teeth (off-white, BGR)
+    # ── 1. Jaw drop — shift entire lower face down ────────────────────────
+    jaw_rows = H - my - open_h          # how many rows survive after the shift
+    if jaw_rows > 0:
+        canvas[my + open_h : H, :] = face[my : H - open_h, :].astype(np.float32)
 
-    # ── 1. Dark mouth interior ─────────────────────────────────────────────
-    # Draw directly onto the original face — the Gaussian feathering lets
-    # the real lip texture show through at the edges, so no artificial
-    # lip-colour bands are needed.
-    _soft_fill(canvas, mx, my, max(1, hw - 4), max(1, open_h), dark, sigma=3)
+    # ── 2. Sample natural lip colour → dark mouth interior ────────────────
+    # Read from the original photo (before warp) at the parting line.
+    sy1 = max(0,  my - 5);     sy2 = min(H, my + 5)
+    sx1 = max(0,  mx - hw + 14); sx2 = min(W, mx + hw - 14)
+    samp = face[sy1:sy2, sx1:sx2].astype(np.float32)
+    lip_color = (
+        np.median(samp.reshape(-1, 3), axis=0)
+        if samp.size > 0
+        else np.array([65., 42., 75.])
+    )
+    interior = lip_color * 0.22          # 22 % brightness → dark but hue-matched
 
-    # ── 2. Teeth strip (upper portion of the opening) ─────────────────────
-    if open_h >= 5:
-        teeth_h = max(1, open_h // 3)
-        teeth_w = max(1, hw - 10)
-        teeth_y = my - open_h + teeth_h + 1
-        _soft_fill(canvas, mx, teeth_y, teeth_w, teeth_h, ivory, sigma=1)
+    # ── 3. Feathered gap fill ─────────────────────────────────────────────
+    # Ellipse centred in the gap, width = mouth width, height = gap height.
+    # Gaussian blur on the mask feathers the boundary into both lip rows.
+    gap_cy = my + open_h // 2
+    gap_rx = max(1, hw - 10)             # slightly narrower than full lip width
+    gap_ry = max(1, open_h // 2 + 1)
+
+    mask   = np.zeros((H, W), dtype=np.float32)
+    cv2.ellipse(mask, (mx, gap_cy), (gap_rx, gap_ry), 0, 0, 360, 1.0, -1)
+
+    sigma  = max(1.5, open_h * 0.30)
+    ks     = max(3, int(sigma * 3) | 1)
+    mask   = cv2.GaussianBlur(mask, (ks, ks), sigmaX=sigma)
+
+    layer  = np.full((H, W, 3), interior, dtype=np.float32)
+    m3     = mask[:, :, np.newaxis]
+    canvas = layer * m3 + canvas * (1.0 - m3)
 
     return np.clip(canvas, 0, 255).astype(np.uint8)
-
-
-# ── Helper ────────────────────────────────────────────────────────────────────
-
-def _soft_fill(
-    canvas: np.ndarray,
-    cx: int, cy: int,
-    rx: int, ry: int,
-    color,
-    sigma: float = 3.0,
-) -> None:
-    """
-    Paint a Gaussian-feathered ellipse of `color` into float32 `canvas` in-place.
-
-    Parameters
-    ----------
-    canvas  : float32 H×W×3 image (modified in-place)
-    cx, cy  : ellipse centre
-    rx, ry  : semi-axes (half-width, half-height)
-    color   : BGR colour (array-like, float values)
-    sigma   : Gaussian blur sigma for edge feathering
-    """
-    H, W = canvas.shape[:2]
-    mask = np.zeros((H, W), dtype=np.float32)
-    cv2.ellipse(
-        mask,
-        (int(cx), int(cy)),
-        (max(1, int(rx)), max(1, int(ry))),
-        0, 0, 360, 1.0, -1,
-    )
-    if sigma > 0:
-        ks = max(3, int(sigma * 3) | 1)   # odd kernel ≥ 3
-        mask = cv2.GaussianBlur(mask, (ks, ks), sigmaX=sigma)
-
-    layer = np.full((H, W, 3), np.array(color, dtype=np.float32), dtype=np.float32)
-    m3 = mask[:, :, np.newaxis]
-    canvas[:] = layer * m3 + canvas * (1.0 - m3)

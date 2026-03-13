@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import Config
 from src.api.routes import router
@@ -76,6 +77,21 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# ── No-cache middleware for index.html ───────────────────────────────────────
+# StaticFiles sets permissive caching. This middleware stamps no-cache headers
+# on every response for index.html so the browser always fetches the latest
+# version — guaranteeing fresh viseme sprites whenever the avatar changes.
+class NoCacheIndexMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path in ("/static/index.html", "/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"]        = "no-cache"
+            response.headers["Expires"]       = "0"
+        return response
+
+app.add_middleware(NoCacheIndexMiddleware)
 
 # CORS
 app.add_middleware(

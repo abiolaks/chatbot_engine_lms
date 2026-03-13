@@ -7,7 +7,7 @@ Genevieve is a fully local, voice-driven AI learning advisor. She listens to you
 ## Table of Contents
 
 1. [Changelog](#changelog)
-2. [How the lip-sync works without MuseTalk](#how-the-lip-sync-works-without-musetalk)
+2. [How the lip-sync works](#how-the-lip-sync-works)
 3. [The autoplay fix](#the-autoplay-fix)
 4. [Architecture overview](#architecture-overview)
 5. [Prerequisites](#prerequisites)
@@ -17,10 +17,42 @@ Genevieve is a fully local, voice-driven AI learning advisor. She listens to you
 9. [Project structure](#project-structure)
 10. [Deployment guide](#deployment-guide)
 11. [MuseTalk GPU upgrade (optional)](#musetalk-gpu-upgrade-optional)
+12. [API contract](#api-contract)
+13. [Backend engineer handoff](#backend-engineer-handoff)
+14. [Frontend developer handoff — LMS integration](#frontend-developer-handoff--lms-integration)
 
 ---
 
 ## Changelog
+
+### Full pipeline reliability hardening (Feb 2026)
+
+**Problems fixed:**
+
+1. **Slow-motion mouth at idle** — the talking-loop video was playing at 0.2× speed when Genevieve was not speaking, causing the mouth to animate slowly with no audio. Fixed by keeping the video hidden during idle; the canvas shows the neutral v0 (closed-mouth) sprite instead.
+2. **Lip sync not following TTS** — the video was being shown during speech but playback rate was not correctly driving it from audio amplitude. Fixed: video shown during speech, rate 1.0–1.8× driven by TTS analyser amplitude, paused between words (mouthTarget < 0.10) so the mouth never drifts to a wide-open frame on silence.
+3. **"I'm here to match you with courses" response loop** — Ollama `stop` tokens `["\n", ".", "?", "!"]` were stripping terminal punctuation from responses. "What do you want to learn?" stopped at "?" without including it; code appended "." making it a statement, which the LLM then treated as off-topic. Fixed by removing stop tokens and using a first-sentence regex extractor to preserve original punctuation.
+4. **LLM ignores instructions** — system prompt replaced with a shorter, simpler version that includes concrete few-shot examples, making `gemma3:4b` reliably ask for missing info instead of triggering the off-topic rule.
+5. **Whisper `tiny` mis-transcribes conversational speech** — upgraded to `base` model (3× more accurate for everyday speech). Set `WHISPER_MODEL=base` in config.
+6. **Empty recordings sent to LLM** — when Whisper returns nothing (silence, background noise, sub-second clip), the string `"[Could not understand audio]"` was passed to the LLM, which responded with the off-topic fallback. Now returns a TTS "I didn't catch that — please try again." without calling the LLM at all.
+7. **Greeting plays simultaneously with microphone recording** — clicking mic unlocked the AudioContext, releasing the queued greeting audio at the same moment the mic opened. The mic captured Genevieve's voice. Fixed: mic click waits for the audio queue to drain (`_onQueueDrained` callback) before opening the microphone.
+8. **VAD always returned zero energy** — `_vadAnalyser` was connected as a side branch (`micSrc → _vadAnalyser`) but not in the path to `destination`. Chrome does not process nodes outside the active graph. Fixed: `micSrc → _vadAnalyser → silentGain(0) → destination`.
+9. **User corrections ignored** — once a value was extracted (e.g. level = beginner), saying "actually I'm advanced" was silently ignored. Fixed: correction trigger words ("actually", "no", "I meant") allow the extracted value to overwrite the stored one.
+10. **Intent extraction too narrow** — added patterns for "just getting started", "comfortable with", "a few years", TypeScript, Next.js, AWS, Azure, PyTorch, TensorFlow, Kotlin, Flutter, "data analytics", "data pipeline", "build websites", "programming", "coding", etc.
+11. **Old context after recommendations** — after firing recommendations the message history was not fully cleared, causing the LLM to reference the previous search topic in the next conversation. Fixed: `session["messages"]` reset to `[_REC_INTRO]` on recommendation.
+
+---
+
+### SadTalker talking-head video (Feb 2026)
+
+Generated `static/videos/talking_loop.mp4` (438 KB, 440×440, H.264, 15.56 s) using SadTalker on CPU with `~/SadTalker/checkpoints/` individual `.pth` files. Shown as the face layer during speech; hidden during idle.
+
+**Key notes for future regeneration:**
+- SadTalker must be run with `--cpu` flag (not `--device cpu`)
+- Use individual `.pth` files — do NOT use `curl -C -` to resume a safetensors download (byte-offset resume from HuggingFace causes data corruption with all tensor weights reading as 0.0 → black output frames)
+- After render: `bash scripts/install_talking_loop.sh` resizes to 440×440 and installs to `static/videos/`
+
+---
 
 ### Audio queue + word streaming (Feb 2026)
 
@@ -86,9 +118,21 @@ Genevieve is a fully local, voice-driven AI learning advisor. She listens to you
 
 ---
 
-## How the lip-sync works without MuseTalk
+## How the lip-sync works
 
-The project ships with two lip-sync modes. **Viseme mode** (default, no GPU required) makes Genevieve's mouth move in the browser. **MuseTalk mode** (optional, GPU required) replaces viseme sprites with photorealistic video.
+The project ships with three lip-sync layers. **Talking-head video** (SadTalker render, shown during speech) gives a natural animated face. **Viseme sprites** (canvas, always running) provide the mouth animation driven by live TTS audio amplitude. **MuseTalk mode** (optional, GPU) replaces both with photorealistic per-response video.
+
+### During speech
+
+The SadTalker video (`talking_loop.mp4`) is shown over the canvas. Its playback rate is driven by the TTS audio analyser: 1.0–1.8× proportional to amplitude, paused between words when `mouthTarget < 0.10`. When the video is visible the canvas sprite animation still runs underneath it and controls the ring glow.
+
+### During idle
+
+The video is hidden (`display: none`). The canvas shows sprite v0 — neutral closed mouth. No animation plays.
+
+### MuseTalk GPU mode
+
+See the [MuseTalk GPU upgrade](#musetalk-gpu-upgrade-optional) section.
 
 ### Viseme mode — end to end
 
@@ -171,20 +215,22 @@ Browser  ──── WebSocket ws://host/api/v1/ws ────  FastAPI (app.p
   │                                                     │
   │  sends: { type:"audio"|"text", audio/text }         │
   │  receives: { type:"response", text, audio,          │
-  │              collected_info }                        │
+  │              action, collected_info }                │
   │  receives: { type:"recommendations", courses }       │
   │                                                     │
   ▼                                                     ▼
 index.html                                    src/api/routes.py
   ├── Audio queue (_audioQueue)                   │
-  │   └── clips play sequentially to completion   ├── STT: SpeechToText (Whisper tiny)
-  ├── Word streaming (setInterval / msPerWord)    │       audio bytes → English text
-  ├── Web Audio AnalyserNode → mouthTarget        ├── NLP: OllamaConversationManager
-  ├── Asymmetric smoothing → mouthCurrent         │       regex extraction (goal/level/career)
-  ├── Canvas viseme cross-fade (v0–v5)            │       Ollama/gemma3:4b — ask for missing info
-  └── Course cards rendered from JSON            ├── Recommendations: recommend_courses()
-                                                  │       all three → top 3 courses scored
-                                                  └── TTS: EdgeTTS (MP3) → Piper fallback (WAV)
+  │   ├── clips play sequentially to completion   ├── STT: SpeechToText (Whisper base)
+  │   └── _onQueueDrained — mic waits here        │       audio bytes → English text
+  ├── Word streaming (setInterval / msPerWord)    ├── NLP: OllamaConversationManager
+  ├── Web Audio AnalyserNode → mouthTarget        │       server-side regex extraction
+  ├── Asymmetric smoothing → mouthCurrent         │       (goal / level / career)
+  ├── Canvas viseme cross-fade (v0–v5)            │       Ollama/gemma3:4b — ask for missing
+  ├── SadTalker video (rate 1.0–1.8×)            │       first-sentence extraction (no stop tokens)
+  │   └── hidden at idle, shown during speech     ├── Recommendations: recommend_courses()
+  ├── VAD: mic energy → auto-stop after 1.5 s     │       all three → top scored courses
+  └── Course cards rendered from JSON            └── TTS: EdgeTTS (MP3) → Piper fallback (WAV)
 ```
 
 ### Component responsibilities
@@ -326,7 +372,7 @@ LIPSYNC_MODE=viseme
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=gemma3:4b
 OLLAMA_TIMEOUT=30
-WHISPER_MODEL=tiny
+WHISPER_MODEL=base
 EDGE_TTS_VOICE=en-US-JennyNeural
 EDGE_TTS_RATE=+0%
 EDGE_TTS_PITCH=+0%
@@ -408,7 +454,7 @@ Click the microphone button (🎤), speak, then click Stop (■). Your audio is 
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `gemma3:4b` | Model name (must be pulled) |
 | `OLLAMA_TIMEOUT` | `30` | Seconds before Ollama times out |
-| `WHISPER_MODEL` | `tiny` | `tiny` / `base` / `small` / `medium` / `large` |
+| `WHISPER_MODEL` | `base` | `tiny` / `base` / `small` / `medium` / `large` |
 | `EDGE_TTS_VOICE` | `en-US-JennyNeural` | Edge TTS voice |
 | `EDGE_TTS_RATE` | `+0%` | Speech rate |
 | `EDGE_TTS_PITCH` | `+0%` | Pitch |
@@ -418,10 +464,10 @@ Click the microphone button (🎤), speak, then click Stop (■). Your audio is 
 
 | Model | Size | Speed | Accuracy |
 |---|---|---|---|
-| `tiny` | 75 MB | fastest | good for clear English |
-| `base` | 145 MB | fast | better |
-| `small` | 465 MB | moderate | noticeably better |
-| `medium` | 1.5 GB | slow on CPU | near-human |
+| `tiny` | 75 MB | fastest | poor for conversational speech |
+| `base` | 145 MB | fast | **recommended — reliable for everyday English** |
+| `small` | 465 MB | moderate | noticeably better, good for accented speech |
+| `medium` | 1.5 GB | slow on CPU | near-human accuracy |
 
 ---
 
@@ -512,7 +558,7 @@ cat > /opt/chatbot/.env << 'EOF'
 LIPSYNC_MODE=viseme
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=gemma3:4b
-WHISPER_MODEL=tiny
+WHISPER_MODEL=base
 EDGE_TTS_VOICE=en-US-JennyNeural
 EOF
 ```
@@ -696,3 +742,328 @@ On first run the avatar face latents are prepared (~60 s) and cached to `MuseTal
 ## MuseTalk GPU upgrade (optional)
 
 See [Option C](#option-c--gpu-server-musetalk-photorealistic-lip-sync) above. The `src/lipsync/musetalk_worker.py` integration is already written and the avatar latents are pre-computed — enabling MuseTalk requires only cloning the MuseTalk repo, downloading weights, and setting `LIPSYNC_MODE=musetalk`.
+
+---
+
+## API contract
+
+This section is the source of truth for both the backend engineer and the frontend/LMS developer. All integrations must conform to this contract.
+
+### WebSocket — `/api/v1/ws`
+
+#### Client → Server
+
+```json
+// Text input
+{ "type": "text", "text": "I want to learn Python as a beginner" }
+
+// Audio input (browser MediaRecorder output, base64-encoded)
+{ "type": "audio", "audio": "<base64>", "mime": "audio/webm;codecs=opus" }
+```
+
+#### Server → Client (messages arrive in this order)
+
+**1. Response message** — always sent after each user turn.
+
+```json
+{
+  "type":           "response",
+  "text":           "What's your experience level and your target career?",
+  "audio":          "<base64 MP3>",
+  "action":         "continue",
+  "collected_info": {
+    "goal":   "Python",
+    "level":  null,
+    "career": null
+  }
+}
+```
+
+| Field | Values | Notes |
+|-------|--------|-------|
+| `type` | `"response"` | Always this string |
+| `text` | string | Spoken text — render in chat bubble |
+| `audio` | base64 MP3 or `null` | Decode with `audioCtx.decodeAudioData()`. Null if TTS failed — show text only. |
+| `action` | `"continue"` \| `"recommend"` | `"recommend"` means the next two messages follow immediately |
+| `collected_info` | object | Current extraction state — use to show a progress indicator if desired |
+
+**2. Recommendations message** — sent immediately after a `"recommend"` response.
+
+```json
+{
+  "type": "recommendations",
+  "courses": [
+    {
+      "title":    "Python for Everybody",
+      "provider": "Coursera",
+      "level":    "beginner",
+      "duration": "4 weeks",
+      "rating":   4.8,
+      "reason":   "Highly rated beginner Python course aligned with data science goal"
+    }
+  ]
+}
+```
+
+Up to 5 courses, sorted by relevance score. The `level` field is always `"beginner"`, `"intermediate"`, or `"advanced"`.
+
+**3. Bridge message** — sent as a second `"response"` after recommendations, inviting the next search.
+
+```json
+{
+  "type":   "response",
+  "text":   "If you'd like to explore a different topic, just tell me what you want to learn next.",
+  "audio":  "<base64 MP3>",
+  "action": "continue",
+  "collected_info": { "goal": null, "level": null, "career": null }
+}
+```
+
+#### On connect
+
+Immediately after the WebSocket handshake the server sends a greeting `response` message (with `audio`) and no user turn is needed. Clients must queue this audio and play it after the first user gesture (browser autoplay policy).
+
+---
+
+### REST endpoints
+
+| Endpoint | Method | Body / Params | Returns |
+|----------|--------|---------------|---------|
+| `/api/v1/health` | GET | — | `{ "status": "ok", "components": {...} }` |
+| `/api/v1/chat` | POST | `?session_id=&message=` | `{ session_id, response, action, audio, collected_info }` |
+| `/api/v1/chat/audio` | POST | multipart: `session_id?`, `audio` file | `{ session_id, transcription, response, action, audio, collected_info }` |
+| `/api/v1/session/{id}` | GET | — | `{ session_id, collected_info, history[-5:] }` |
+| `/api/v1/session/{id}` | DELETE | — | `{ status: "cleared" }` |
+
+Full Swagger UI: `/docs`
+
+---
+
+## Backend engineer handoff
+
+### What is already built
+
+The FastAPI application is functionally complete. The backend engineer's job is to harden it for production scale, not to rebuild it.
+
+| Component | Status | File |
+|-----------|--------|------|
+| WebSocket handler | Done | `src/api/routes.py` |
+| STT (Whisper base) | Done | `src/stt/speech_to_text.py` |
+| LLM conversation manager | Done | `src/nlp/ollama_conversation.py` |
+| TTS (Edge + Piper fallback) | Done | `src/tts/edge_tts.py` |
+| Recommendation engine | Done | `src/recommendations/engine.py` |
+| Course catalogue (24 courses) | Done | `src/recommendations/courses.py` |
+| Viseme lip-sync sprites | Done | `src/lipsync/viseme_generator.py` |
+| Deployment (systemd + Nginx + Docker) | Done | README |
+
+### Tasks required for production
+
+#### 1. Authentication
+
+The WebSocket currently accepts any connection with no auth. Add token-based auth:
+
+```python
+# In websocket_endpoint, read a token from the query string:
+# ws://host/api/v1/ws?token=<jwt>
+# Validate against your LMS user system before calling websocket.accept()
+```
+
+#### 2. Replace in-memory session store with Redis
+
+`OllamaConversationManager.sessions` is a plain Python dict. Server restarts or horizontal scaling silently loses all sessions. Replace with Redis:
+
+```python
+# pip install redis
+import redis.asyncio as redis
+
+class OllamaConversationManager:
+    def __init__(self):
+        self.redis = redis.from_url("redis://localhost:6379")
+
+    async def get_session(self, session_id):
+        raw = await self.redis.get(f"session:{session_id}")
+        return json.loads(raw) if raw else None
+
+    async def save_session(self, session_id, session):
+        await self.redis.set(
+            f"session:{session_id}", json.dumps(session), ex=3600
+        )
+```
+
+#### 3. Move Whisper to async worker
+
+`stt.transcribe()` is a synchronous blocking call that runs on the FastAPI event loop thread. For concurrent users this stalls all other requests. Move it to a thread pool:
+
+```python
+import asyncio, concurrent.futures
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+async def transcribe_async(audio_bytes, mime_type):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor, stt.transcribe, audio_bytes, mime_type
+    )
+```
+
+#### 4. CORS middleware
+
+The LMS frontend will be on a different origin. Add CORS before shipping:
+
+```python
+# In app.py
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://your-lms-domain.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+#### 5. Piper offline TTS
+
+Edge TTS requires internet. Download a Piper voice model for offline fallback (see setup step 7 above). Set `PIPER_MODEL_PATH` in the deployment `.env`.
+
+#### 6. Environment variables for production
+
+```bash
+LIPSYNC_MODE=viseme
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=gemma3:4b
+OLLAMA_TIMEOUT=30
+WHISPER_MODEL=base
+EDGE_TTS_VOICE=en-US-JennyNeural
+PIPER_MODEL_PATH=models/piper/en_US-amy-medium.onnx
+REDIS_URL=redis://localhost:6379      # add when Redis is integrated
+```
+
+#### 7. Extend the course catalogue
+
+`src/recommendations/courses.py` contains 24 courses. Add more by appending to the `COURSES` list using the same dict schema:
+
+```python
+{
+    "id":       "py-adv-01",
+    "title":    "Advanced Python — Decorators and Metaclasses",
+    "provider": "Pluralsight",
+    "level":    "advanced",         # "beginner" | "intermediate" | "advanced"
+    "duration": "6 hours",
+    "rating":   4.7,
+    "tags":     ["python", "advanced", "software engineer", "backend developer"],
+}
+```
+
+Tags drive the keyword scoring in `src/recommendations/engine.py`. Match them to the values extracted by the regex patterns in `ollama_conversation.py`.
+
+---
+
+## Frontend developer handoff — LMS integration
+
+### What you are integrating
+
+A voice-driven AI advisor widget that:
+1. Opens a WebSocket connection to the backend
+2. Speaks to the user via TTS audio + animated avatar
+3. Listens to the user via microphone (VAD auto-stop)
+4. Returns up to 5 structured course recommendations as JSON
+
+The standalone prototype is `static/index.html` — use it as the definitive reference implementation. All production logic is there.
+
+### Minimum integration requirements
+
+| Requirement | Why |
+|-------------|-----|
+| **HTTPS only** | `getUserMedia()` (microphone) is blocked on plain HTTP in all modern browsers |
+| **WebSocket upgrade headers in proxy** | Nginx must pass `Upgrade: websocket` and `Connection: upgrade` — see deployment guide |
+| **CORS** | Backend must whitelist your LMS origin — ask the backend engineer to set this up |
+| **No iframe for audio** | `AudioContext` and `getUserMedia` do not work in cross-origin iframes without `allow="microphone; autoplay"` |
+
+### Integration approach
+
+Extract three pieces from `static/index.html` into your LMS:
+
+#### A. WebSocket + audio engine (`genevieve-sdk.js`)
+
+Copy the JavaScript from `static/index.html` into a module. The public API surface you need:
+
+```javascript
+// Connect and receive events
+connect();                          // opens ws, sends greeting automatically
+
+// Send a text message
+sendText("I want to learn Python"); // calls ws.send(), shows bubble, triggers thinking
+
+// Send audio (base64 blob from MediaRecorder)
+ws.send(JSON.stringify({ type: "audio", audio: b64, mime: "audio/webm;codecs=opus" }));
+
+// Receive events via ws.onmessage — two message types to handle:
+//   msg.type === "response"        → play audio, show text bubble
+//   msg.type === "recommendations" → render course cards
+```
+
+The full audio queue, VAD, `_unlockAudio()`, and word streaming logic must be included unchanged. Do not replace these with simpler audio playback — the autoplay unlock and queue sequencing are critical for correct behaviour.
+
+#### B. Avatar panel
+
+The avatar requires:
+
+- A `220×220` `<canvas id="avatar-canvas">` for the viseme sprites
+- A `<video id="talking-vid" loop muted playsinline preload="auto">` positioned absolutely over the canvas, hidden by default
+- Six sprite images served from `/static/images/visemes/v0.jpg` … `v5.jpg`
+- The `talking_loop.mp4` video served from `/static/videos/talking_loop.mp4`
+
+The canvas renders at 60 fps via `requestAnimationFrame`. No GPU is required.
+
+#### C. Course card rendering
+
+On `msg.type === "recommendations"`, render `msg.courses` using your LMS card style. Each course object:
+
+```typescript
+interface Course {
+  title:    string;   // "Python for Everybody"
+  provider: string;   // "Coursera"
+  level:    "beginner" | "intermediate" | "advanced";
+  duration: string;   // "4 weeks"
+  rating:   number;   // 4.8
+  reason:   string;   // one-sentence relevance explanation
+}
+```
+
+### Audio format
+
+The server sends MP3 audio base64-encoded in the `audio` field. Decode with the Web Audio API:
+
+```javascript
+const bytes = Uint8Array.from(atob(msg.audio), c => c.charCodeAt(0));
+audioCtx.decodeAudioData(bytes.buffer.slice(0), buffer => {
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioCtx.destination);
+  source.start();
+});
+```
+
+The analyser node for lip sync must sit between the source and destination — see `_playItem()` in `index.html` for the complete graph.
+
+### Microphone and VAD
+
+`getUserMedia` requires a user gesture and HTTPS. The mic button flow:
+
+1. User clicks → `_unlockAudio()` → `getUserMedia()` → `MediaRecorder.start(250)`
+2. VAD monitors 100–3500 Hz speech-band energy every 50 ms
+3. After 1.5 s of silence following speech → `mediaRecorder.stop()` → audio blob sent
+4. User can also click Stop manually at any time
+
+Set `VAD_SPEECH_THRESHOLD` (default `30`, range 0–255) to calibrate for your deployment environment. Increase if false-positives on background noise; decrease if speech is not detected.
+
+### Browser compatibility
+
+| Browser | Status |
+|---------|--------|
+| Chrome 90+ | Full support |
+| Edge 90+ | Full support |
+| Firefox 90+ | Full support |
+| Safari 15.4+ | Full support (uses `webkitAudioContext` — already handled) |
+| Mobile Chrome | Full support over HTTPS |
+| Mobile Safari | Requires HTTPS; test microphone permissions carefully |
